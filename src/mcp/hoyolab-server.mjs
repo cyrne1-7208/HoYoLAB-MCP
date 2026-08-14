@@ -17,11 +17,16 @@ import {
 const SERVER_NAME = "hoyolab-mcp";
 const SERVER_VERSION = "0.1.0";
 const LANGUAGE_SCHEMA = z.string().regex(/^[a-z]{2,3}(?:-[a-z]{2,4})?$/i).optional()
-  .describe("HoYoLAB language code, for example ja-jp, en-us, or zh-cn");
+  .describe("HoYoLAB language code, for example ja-jp, en-us, or zh-cn; short aliases such as JA, JP, and EN are normalized");
 const POST_ID_SCHEMA = z.string().regex(/^\d+$/).describe("Numeric HoYoLAB post ID");
 const ENTRY_ID_SCHEMA = z.string().regex(/^\d+$/).describe("Numeric HoYoWiki entry page ID");
 const WIKI_APP_SCHEMA = z.string().regex(/^[a-z0-9_-]+$/i).default("genshin")
   .describe("HoYoWiki application name, for example genshin");
+const SEARCH_ORDER_TYPE_SCHEMA = z.union([z.literal(0), z.literal(2)]).default(0)
+  .describe("Search order: 0 = relevance/default, 2 = latest posts");
+// The followed-account option is not exposed because the anonymous public API rejects it.
+const SEARCH_AUTHOR_TYPE_SCHEMA = z.union([z.literal(0), z.literal(1), z.literal(2)]).default(0)
+  .describe("Author filter: 0 = all, 1 = official accounts, 2 = authenticated accounts");
 const READ_ONLY_ANNOTATIONS = Object.freeze({
   readOnlyHint: true,
   destructiveHint: false,
@@ -101,7 +106,21 @@ function searchWikiResult(item) {
   });
 }
 
-function formatPostSearch({ keyword, data, page, pageSize }) {
+function searchFilterInfo(orderType, authorType) {
+  const authorLabels = {
+    0: "all",
+    1: "official",
+    2: "authenticated"
+  };
+  return {
+    order_type: orderType,
+    order: Number(orderType) === 2 ? "latest" : "relevance",
+    author_type: authorType,
+    author: authorLabels[authorType] || "unknown"
+  };
+}
+
+function formatPostSearch({ keyword, data, page, pageSize, orderType, authorType, language }) {
   // Search results expose identifiers and context while full readable content remains the responsibility of the read tool.
   const list = Array.isArray(data?.list) ? data.list : [];
   const results = list.map(searchPostResult);
@@ -123,6 +142,8 @@ function formatPostSearch({ keyword, data, page, pageSize }) {
       keyword,
       page,
       page_size: pageSize,
+      language,
+      filters: searchFilterInfo(orderType, authorType),
       is_last: data?.is_last,
       next_offset: data?.next_offset,
       results
@@ -130,7 +151,7 @@ function formatPostSearch({ keyword, data, page, pageSize }) {
   };
 }
 
-function formatWikiSearch({ keyword, data, page, pageSize }) {
+function formatWikiSearch({ keyword, data, page, pageSize, orderType, authorType, language }) {
   const posts = Array.isArray(data?.posts) ? data.posts.map(searchPostResult) : [];
   const entries = Array.isArray(data?.entry_pages) ? data.entry_pages.map(searchWikiResult) : [];
   const lines = [`# HoYoLAB Wiki search: ${keyword}`, ""];
@@ -159,6 +180,8 @@ function formatWikiSearch({ keyword, data, page, pageSize }) {
       keyword,
       page,
       page_size: pageSize,
+      language,
+      filters: searchFilterInfo(orderType, authorType),
       is_last: data?.is_last,
       recommend_words: data?.recommend_words,
       entry_pages: entries,
@@ -265,6 +288,7 @@ function replyRecord(item, language, depth, parentReplyId) {
     created_at: isoDate(reply.created_at ?? reply.create_time),
     body: bodyResult.body || undefined,
     body_source: bodyResult.source,
+    language: reply.lang || language,
     images: replyImageUrls(item, reply),
     is_deleted: deleted || undefined,
     sub_reply_count: item?.sub_reply_count ?? reply.sub_reply_count
@@ -324,6 +348,7 @@ function formatReplies(payload, postId, language) {
       kind: "article-replies",
       post_id: postId,
       language,
+      languages: [...new Set(records.map((record) => record.language).filter(Boolean))],
       count: items.length,
       total_count: records.length,
       is_last: data?.is_last,
@@ -376,8 +401,8 @@ export function createHoYoLabMcpServer({ apiClient = createHoYoLabClient() } = {
       game_id: z.number().int().min(0).max(100000).optional().describe("HoYoLAB game ID; Genshin Impact is 2"),
       page: z.number().int().min(1).max(10000).default(1),
       page_size: z.number().int().min(1).max(50).default(15),
-      order_type: z.number().int().min(0).max(10).default(0),
-      author_type: z.number().int().min(0).max(10).default(0),
+      order_type: SEARCH_ORDER_TYPE_SCHEMA,
+      author_type: SEARCH_AUTHOR_TYPE_SCHEMA,
       is_all_game: z.boolean().default(false),
       scene: z.string().min(1).max(64).default("SCENE_GENERAL"),
       language: LANGUAGE_SCHEMA
@@ -395,7 +420,8 @@ export function createHoYoLabMcpServer({ apiClient = createHoYoLabClient() } = {
       scene,
       language
     });
-    const result = formatPostSearch({ keyword, data: response.data, page, pageSize: page_size });
+    const effectiveLanguage = response.language || language;
+    const result = formatPostSearch({ keyword, data: response.data, page, pageSize: page_size, orderType: order_type, authorType: author_type, language: effectiveLanguage });
     return toolSuccess(result.text, result.structured);
   }));
 
@@ -407,8 +433,8 @@ export function createHoYoLabMcpServer({ apiClient = createHoYoLabClient() } = {
       game_id: z.number().int().min(0).max(100000).optional().describe("HoYoLAB game ID; Genshin Impact is 2"),
       page: z.number().int().min(1).max(10000).default(1),
       page_size: z.number().int().min(1).max(50).default(15),
-      order_type: z.number().int().min(0).max(10).default(0),
-      author_type: z.number().int().min(0).max(10).default(0),
+      order_type: SEARCH_ORDER_TYPE_SCHEMA,
+      author_type: SEARCH_AUTHOR_TYPE_SCHEMA,
       is_all_game: z.boolean().default(false),
       language: LANGUAGE_SCHEMA
     },
@@ -424,7 +450,8 @@ export function createHoYoLabMcpServer({ apiClient = createHoYoLabClient() } = {
       isAllGame: is_all_game,
       language
     });
-    const result = formatWikiSearch({ keyword, data: response.data, page, pageSize: page_size });
+    const effectiveLanguage = response.language || language;
+    const result = formatWikiSearch({ keyword, data: response.data, page, pageSize: page_size, orderType: order_type, authorType: author_type, language: effectiveLanguage });
     return toolSuccess(result.text, result.structured);
   }));
 
@@ -439,14 +466,18 @@ export function createHoYoLabMcpServer({ apiClient = createHoYoLabClient() } = {
   }, withToolErrors(async ({ post_id, language }) => {
     const response = await apiClient.getArticle({ postId: post_id, language });
     const bundle = articleBundle(response.payload);
+    const effectiveLanguage = response.language || language;
     // Build the document once so the visible MCP text and structured metadata cannot diverge.
-    const mdx = articleToMdx(response.payload, { language, sourceUrl: response.url });
+    const mdx = articleToMdx(response.payload, { language: effectiveLanguage, sourceUrl: response.url });
     return toolSuccess(mdx, compactObject({
       kind: "article",
       format: "mdx",
       post_id,
       title: cleanTitle(bundle.post.subject || bundle.post.title),
-      language: bundle.post.lang || language,
+      language: bundle.post.lang || effectiveLanguage,
+      api_origin_lang: bundle.post.origin_lang,
+      is_multilingual: bundle.post.is_multi_language,
+      available_languages: Array.isArray(bundle.post.multi_language_info?.langs) ? bundle.post.multi_language_info.langs : undefined,
       source_url: response.url,
       human_url: articleUrl(post_id),
       body_source: mdx.match(/^body_source: ([^\n]+)/m)?.[1],
@@ -465,16 +496,18 @@ export function createHoYoLabMcpServer({ apiClient = createHoYoLabClient() } = {
     annotations: READ_ONLY_ANNOTATIONS
   }, withToolErrors(async ({ wiki_app, entry_page_id, language }) => {
     const response = await apiClient.getWiki({ wikiApp: wiki_app, entryPageId: entry_page_id, language });
+    const effectiveLanguage = response.language || language;
     const page = unwrapApiData(response.payload)?.page ?? {};
     // The complete entry is rendered once and reused for both response channels.
-    const mdx = wikiToMdx(response.payload, { wikiApp: wiki_app, language, sourceUrl: response.url });
+    const mdx = wikiToMdx(response.payload, { wikiApp: wiki_app, language: effectiveLanguage, sourceUrl: response.url });
     return toolSuccess(mdx, compactObject({
       kind: "wiki",
       format: "mdx",
       wiki_app,
       entry_page_id,
       title: cleanTitle(page.name),
-      language: page.lang || language,
+      language: page.lang || effectiveLanguage,
+      available_languages: Array.isArray(page.langs) ? page.langs : undefined,
       source_url: response.url,
       human_url: wikiUrl(wiki_app, entry_page_id),
       mdx
@@ -492,7 +525,8 @@ export function createHoYoLabMcpServer({ apiClient = createHoYoLabClient() } = {
     annotations: READ_ONLY_ANNOTATIONS
   }, withToolErrors(async ({ wiki_app, entry_page_id, language }) => {
     const response = await apiClient.getWiki({ wikiApp: wiki_app, entryPageId: entry_page_id, language });
-    const hierarchy = wikiHierarchy(response.payload, { wikiApp: wiki_app, language, sourceUrl: response.url });
+    const effectiveLanguage = response.language || language;
+    const hierarchy = wikiHierarchy(response.payload, { wikiApp: wiki_app, language: effectiveLanguage, sourceUrl: response.url });
     return toolSuccess(formatWikiHierarchy(hierarchy), hierarchy);
   }));
 
@@ -508,14 +542,16 @@ export function createHoYoLabMcpServer({ apiClient = createHoYoLabClient() } = {
     annotations: READ_ONLY_ANNOTATIONS
   }, withToolErrors(async ({ wiki_app, entry_page_id, module, language }) => {
     const response = await apiClient.getWiki({ wikiApp: wiki_app, entryPageId: entry_page_id, language });
+    const effectiveLanguage = response.language || language;
     // Scoped reads resolve selectors against the same hierarchy used by the full-entry renderer.
-    const mdx = wikiLocationToMdx(response.payload, { wikiApp: wiki_app, language, sourceUrl: response.url }, { module });
+    const mdx = wikiLocationToMdx(response.payload, { wikiApp: wiki_app, language: effectiveLanguage, sourceUrl: response.url }, { module });
     return toolSuccess(mdx, compactObject({
       kind: "wiki",
       format: "mdx",
       scope: "module",
       wiki_app,
       entry_page_id,
+      language: effectiveLanguage,
       module_selector: module,
       source_url: response.url,
       human_url: wikiUrl(wiki_app, entry_page_id),
@@ -536,14 +572,16 @@ export function createHoYoLabMcpServer({ apiClient = createHoYoLabClient() } = {
     annotations: READ_ONLY_ANNOTATIONS
   }, withToolErrors(async ({ wiki_app, entry_page_id, module, component, language }) => {
     const response = await apiClient.getWiki({ wikiApp: wiki_app, entryPageId: entry_page_id, language });
+    const effectiveLanguage = response.language || language;
     // The parent module is required so a component name or number is unambiguous within the entry.
-    const mdx = wikiLocationToMdx(response.payload, { wikiApp: wiki_app, language, sourceUrl: response.url }, { module, component });
+    const mdx = wikiLocationToMdx(response.payload, { wikiApp: wiki_app, language: effectiveLanguage, sourceUrl: response.url }, { module, component });
     return toolSuccess(mdx, compactObject({
       kind: "wiki",
       format: "mdx",
       scope: "component",
       wiki_app,
       entry_page_id,
+      language: effectiveLanguage,
       module_selector: module,
       component_selector: component,
       source_url: response.url,
@@ -566,7 +604,7 @@ export function createHoYoLabMcpServer({ apiClient = createHoYoLabClient() } = {
   }, withToolErrors(async ({ post_id, size, page, list_type, language }) => {
     const response = await apiClient.getReplies({ postId: post_id, size, page, listType: list_type, language });
     // Reply formatting preserves nesting through depth headings and keeps reply records available to callers.
-    const result = formatReplies(response.payload, post_id, language);
+    const result = formatReplies(response.payload, post_id, response.language || language);
     return toolSuccess(result.text, result.structured);
   }));
 

@@ -11,7 +11,29 @@ export const HOYOLAB_ENDPOINTS = Object.freeze({
   wiki: `${WIKI_API_BASE}/hoyowiki`
 });
 
-const LANGUAGE_PATTERN = /^[a-z]{2,3}(?:-[a-z]{2,4})?$/i;
+// HoYoLAB exposes these values through its language resource (including short aliases such as JA/JP).
+// Normalize aliases before sending the header so a valid-looking but unsupported locale cannot silently fall back to English.
+const LANGUAGE_ALIASES = Object.freeze({
+  "zh-cn": "zh-cn", chs: "zh-cn",
+  "zh-tw": "zh-tw", cht: "zh-tw",
+  "de-de": "de-de", de: "de-de",
+  "en-us": "en-us", en: "en-us",
+  "es-es": "es-es", es: "es-es",
+  "fr-fr": "fr-fr", fr: "fr-fr",
+  "id-id": "id-id", id: "id-id",
+  "it-it": "it-it", it: "it-it",
+  "ja-jp": "ja-jp", ja: "ja-jp", jp: "ja-jp",
+  "ko-kr": "ko-kr", ko: "ko-kr", kr: "ko-kr",
+  "pt-pt": "pt-pt", pt: "pt-pt",
+  "ru-ru": "ru-ru", ru: "ru-ru",
+  "th-th": "th-th", th: "th-th",
+  "tr-tr": "tr-tr", tr: "tr-tr",
+  "vi-vn": "vi-vn", vi: "vi-vn", vn: "vi-vn"
+});
+const LANGUAGE_CODES = Object.freeze([...new Set(Object.values(LANGUAGE_ALIASES))]);
+const SEARCH_ORDER_TYPE_VALUES = Object.freeze([0, 2]);
+// HoYoLAB has an additional followed-account author_type, but anonymous public search rejects it; keep author_type=3 out of the MCP/API surface.
+const SEARCH_AUTHOR_TYPE_VALUES = Object.freeze([0, 1, 2]);
 
 // HoYoLAB uses locale headers to select multilingual article, reply, and Wiki responses.
 
@@ -25,17 +47,24 @@ export class HoYoLabApiError extends Error {
   }
 }
 
-function assertLanguage(language) {
-  if (language === undefined || language === null || language === "") return;
-  if (!LANGUAGE_PATTERN.test(language)) {
-    throw new HoYoLabApiError(`Invalid language: ${language}`);
+export function normalizeHoYoLabLanguage(language) {
+  if (language === undefined || language === null || language === "") return "";
+  const normalized = LANGUAGE_ALIASES[String(language).trim().toLowerCase()];
+  if (!normalized) {
+    throw new HoYoLabApiError(`Unsupported language: ${language}. Supported codes: ${LANGUAGE_CODES.join(", ")}`);
   }
+  return normalized;
 }
 
 function safeInteger(value, fallback, { min, max }) {
   const number = Number(value);
   if (!Number.isInteger(number) || number < min || number > max) return fallback;
   return number;
+}
+
+function safeEnumInteger(value, fallback, values) {
+  const number = Number(value);
+  return values.includes(number) ? number : fallback;
 }
 
 function stringId(value, name) {
@@ -49,11 +78,11 @@ function setIfDefined(url, key, value) {
 }
 
 function languageHeaders(language, extra = {}) {
-  assertLanguage(language);
+  const normalizedLanguage = normalizeHoYoLabLanguage(language);
   const headers = { accept: "application/json", ...extra };
-  if (language) {
-    headers["x-rpc-language"] = language;
-    headers["accept-language"] = language;
+  if (normalizedLanguage) {
+    headers["x-rpc-language"] = normalizedLanguage;
+    headers["accept-language"] = normalizedLanguage;
   }
   return headers;
 }
@@ -81,7 +110,7 @@ export function createHoYoLabClient({
   const requestTimeoutMs = Number.isFinite(timeoutMs) && timeoutMs > 0 ? timeoutMs : 20000;
 
   async function get(url, { language = defaultLanguage, headers = {}, signal } = {}) {
-    assertLanguage(language);
+    const normalizedLanguage = normalizeHoYoLabLanguage(language);
     const controller = new AbortController();
     const timer = setTimeout(() => controller.abort(), requestTimeoutMs);
     const onAbort = () => controller.abort();
@@ -89,7 +118,7 @@ export function createHoYoLabClient({
     try {
       const response = await fetchImpl(url, {
         method: "GET",
-        headers: languageHeaders(language, headers),
+        headers: languageHeaders(normalizedLanguage, headers),
         signal: controller.signal
       });
       // Parse the complete response before checking the API return code so callers receive useful error details.
@@ -118,7 +147,7 @@ export function createHoYoLabClient({
           retcode: payload.retcode
         });
       }
-      return { payload, data: unwrapApiResponse(payload), url, status: response.status };
+      return { payload, data: unwrapApiResponse(payload), url, status: response.status, language: normalizedLanguage || undefined };
     } catch (error) {
       if (error?.name === "AbortError") throw abortError(url, requestTimeoutMs);
       if (error instanceof HoYoLabApiError) throw error;
@@ -144,11 +173,11 @@ export function createHoYoLabClient({
     const term = String(keyword ?? "").trim();
     if (!term) throw new HoYoLabApiError("keyword is required");
     const url = new URL(endpoints.searchPosts);
-    setIfDefined(url, "author_type", safeInteger(authorType, 0, { min: 0, max: 10 }));
+    setIfDefined(url, "author_type", safeEnumInteger(authorType, 0, SEARCH_AUTHOR_TYPE_VALUES));
     setIfDefined(url, "game_id", safeInteger(gameId, defaultGameId, { min: 0, max: 100000 }));
     setIfDefined(url, "is_all_game", Boolean(isAllGame));
     setIfDefined(url, "keyword", term);
-    setIfDefined(url, "order_type", safeInteger(orderType, 0, { min: 0, max: 10 }));
+    setIfDefined(url, "order_type", safeEnumInteger(orderType, 0, SEARCH_ORDER_TYPE_VALUES));
     setIfDefined(url, "page_num", safeInteger(page, 1, { min: 1, max: 10000 }));
     setIfDefined(url, "page_size", safeInteger(pageSize, 15, { min: 1, max: 50 }));
     setIfDefined(url, "scene", scene || "SCENE_GENERAL");
@@ -170,11 +199,11 @@ export function createHoYoLabClient({
     const term = String(keyword ?? "").trim();
     if (!term) throw new HoYoLabApiError("keyword is required");
     const url = new URL(endpoints.searchWiki);
-    setIfDefined(url, "author_type", safeInteger(authorType, 0, { min: 0, max: 10 }));
+    setIfDefined(url, "author_type", safeEnumInteger(authorType, 0, SEARCH_AUTHOR_TYPE_VALUES));
     setIfDefined(url, "game_id", safeInteger(gameId, defaultGameId, { min: 0, max: 100000 }));
     setIfDefined(url, "is_all_game", Boolean(isAllGame));
     setIfDefined(url, "keyword", term);
-    setIfDefined(url, "order_type", safeInteger(orderType, 0, { min: 0, max: 10 }));
+    setIfDefined(url, "order_type", safeEnumInteger(orderType, 0, SEARCH_ORDER_TYPE_VALUES));
     setIfDefined(url, "page_num", safeInteger(page, 1, { min: 1, max: 10000 }));
     setIfDefined(url, "page_size", safeInteger(pageSize, 15, { min: 1, max: 50 }));
     return get(url.toString(), { language, signal });

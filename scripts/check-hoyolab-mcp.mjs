@@ -79,20 +79,33 @@ try {
   if (missing.length) throw new Error(`Missing MCP tools: ${missing.join(", ")}`);
 
   const checks = [
-    await callAndSummarize("search_hoyolab_posts", { keyword: "Genshin Impact", page_size: 2 }, ({ structured }) => {
+    await callAndSummarize("search_hoyolab_posts", { keyword: "Genshin Impact", page_size: 2, order_type: 2, author_type: 1 }, ({ structured }) => {
       if (!structured.results?.some((result) => /^\d+$/.test(result.post_id || ""))) {
         throw new Error("search_hoyolab_posts returned no usable numeric post_id");
       }
+      if (structured.filters?.order !== "latest" || structured.filters?.author !== "official") {
+        throw new Error("search_hoyolab_posts did not preserve order_type/author_type filters");
+      }
     }, "search_hoyolab_posts:genshin"),
-    await callAndSummarize("search_hoyowiki", { keyword: "Mavuika", page_size: 5 }, ({ structured }) => {
+    await callAndSummarize("search_hoyowiki", { keyword: "Mavuika", page_size: 5, order_type: 0, author_type: 0 }, ({ structured }) => {
       if (!structured.entry_pages?.some((entry) => entry.entry_page_id === "7299" && entry.wiki_app === "genshin")) {
         throw new Error("search_hoyowiki did not derive entry_page_id/wiki_app from web_path");
+      }
+      if (structured.filters?.order !== "relevance" || structured.filters?.author !== "all") {
+        throw new Error("search_hoyowiki did not preserve order_type/author_type filters");
       }
     }, "search_hoyowiki:mavuika"),
     await callAndSummarize("read_hoyolab_article", { post_id: "45842980", language: "ja-jp" }, ({ text, structured }) => {
       requireText(text, "## Article body", "read_hoyolab_article:45842980:ja-jp content");
       validateMdxResult("article", "read_hoyolab_article:45842980:ja-jp")({ text, structured });
     }, "read_hoyolab_article:45842980:ja-jp"),
+    await callAndSummarize("read_hoyolab_article", { post_id: "45842980", language: "JA" }, ({ text, structured }) => {
+      validateMdxResult("article", "read_hoyolab_article:45842980:JA")({ text, structured });
+      if (structured.language !== "ja-jp") throw new Error("read_hoyolab_article:45842980:JA did not normalize the language alias");
+      if (!structured.is_multilingual || !structured.available_languages?.includes("ja-jp")) {
+        throw new Error("read_hoyolab_article:45842980:JA did not return multilingual metadata");
+      }
+    }, "read_hoyolab_article:45842980:JA"),
     await callAndSummarize("read_hoyolab_article", { post_id: "45842980", language: "en-us" }, ({ text, structured }) => {
       requireText(text, "## Article body", "read_hoyolab_article:45842980:en-us content");
       validateMdxResult("article", "read_hoyolab_article:45842980:en-us")({ text, structured });

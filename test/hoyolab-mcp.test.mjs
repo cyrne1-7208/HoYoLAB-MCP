@@ -30,6 +30,25 @@ test("HoYoLAB API client builds observed endpoints and language headers", async 
   assert.equal(calls[0].options.headers["x-rpc-language"], "ja-jp");
   assert.equal(calls[0].options.headers["accept-language"], "ja-jp");
   assert.equal(calls[0].options.headers["x-rpc-wiki_app"], "genshin");
+
+  await client.searchPosts({ keyword: "Genshin", orderType: 2, authorType: 1 });
+  const postSearchUrl = new URL(calls[1].url);
+  assert.equal(postSearchUrl.searchParams.get("order_type"), "2");
+  assert.equal(postSearchUrl.searchParams.get("author_type"), "1");
+
+  await client.searchWiki({ keyword: "Mavuika", orderType: 2, authorType: 2 });
+  const wikiSearchUrl = new URL(calls[2].url);
+  assert.equal(wikiSearchUrl.searchParams.get("order_type"), "2");
+  assert.equal(wikiSearchUrl.searchParams.get("author_type"), "2");
+
+  await client.searchPosts({ keyword: "Genshin", authorType: 3 });
+  const unsupportedAuthorUrl = new URL(calls[3].url);
+  assert.equal(unsupportedAuthorUrl.searchParams.get("author_type"), "0");
+
+  await client.getArticle({ postId: "123", language: "JA" });
+  assert.equal(calls[4].options.headers["x-rpc-language"], "ja-jp");
+  assert.equal(calls[4].options.headers["accept-language"], "ja-jp");
+  await assert.rejects(() => client.getArticle({ postId: "123", language: "xx-yy" }), /Unsupported language/);
 });
 
 test("MCP exposes MDX article and Wiki tools over the protocol", async () => {
@@ -40,7 +59,11 @@ test("MCP exposes MDX article and Wiki tools over the protocol", async () => {
         post: {
           post_id: "123",
           subject: "Example article",
-          content: "<h2>Summary</h2><p>Hello Traveler.</p>"
+          content: "<h2>Summary</h2><p>Hello Traveler.</p>",
+          lang: "ja-jp",
+          origin_lang: "en-us",
+          is_multi_language: true,
+          multi_language_info: { langs: ["en-us", "ja-jp"] }
         },
         user: { nickname: "Author" },
         game: { game_name: "Genshin Impact" }
@@ -75,6 +98,7 @@ test("MCP exposes MDX article and Wiki tools over the protocol", async () => {
       list: [{
         reply: {
           reply_id: "9",
+          lang: "ja-jp",
           content: "Fallback [emoji]",
           struct_content: JSON.stringify([
             { insert: "Structured reply" },
@@ -91,18 +115,25 @@ test("MCP exposes MDX article and Wiki tools over the protocol", async () => {
       }]
     }
   };
+  const searchCalls = { posts: [], wiki: [] };
   const apiClient = {
-    searchPosts: async () => ({ data: {
+    searchPosts: async (options) => {
+      searchCalls.posts.push(options);
+      return { data: {
       list: [{ post: { post_id: "456", subject: "Search result", content: "Snippet" } }],
       is_last: true
-    } }),
-    searchWiki: async () => ({ data: {
+      } };
+    },
+    searchWiki: async (options) => {
+      searchCalls.wiki.push(options);
+      return { data: {
       posts: [],
       entry_pages: [{ web_path: "https://wiki.hoyolab.com/pc/genshin/entry/7299", name: "Mavuika", menu_name: "Character Archive", game_name: "Genshin Impact" }],
       is_last: true
-    } }),
+      } };
+    },
     getArticle: async () => ({ payload: articlePayload, url: "https://bbs-api-os.hoyolab.com/community/post/wapi/getPostFull?post_id=123" }),
-    getWiki: async () => ({ payload: wikiPayload, url: "https://sg-act-public-api-static.hoyolab.com/hoyowiki/genshin/wapi/entry_page?entry_page_id=49" }),
+    getWiki: async () => ({ payload: wikiPayload, url: "https://sg-act-public-api-static.hoyolab.com/hoyowiki/genshin/wapi/entry_page?entry_page_id=49", language: "ja-jp" }),
     getReplies: async () => ({ payload: repliesPayload })
   };
 
@@ -126,15 +157,45 @@ test("MCP exposes MDX article and Wiki tools over the protocol", async () => {
       "read_hoyolab_replies"
     ]
   );
+  for (const toolName of ["search_hoyolab_posts", "search_hoyowiki"]) {
+    const tool = listed.tools.find(({ name }) => name === toolName);
+    assert.ok(tool);
+    assert.doesNotMatch(JSON.stringify(tool.inputSchema.properties.author_type), /3|followed/i);
+  }
 
-  const postSearch = await client.callTool({ name: "search_hoyolab_posts", arguments: { keyword: "Search" } });
+  const postSearch = await client.callTool({ name: "search_hoyolab_posts", arguments: { keyword: "Search", order_type: 2, author_type: 1 } });
   assert.match(postSearch.content.find((item) => item.type === "text")?.text || "", /post_id: 456/);
   assert.equal(postSearch.structuredContent.results[0].post_id, "456");
+  assert.deepEqual(searchCalls.posts[0], {
+    keyword: "Search",
+    gameId: undefined,
+    page: 1,
+    pageSize: 15,
+    orderType: 2,
+    authorType: 1,
+    isAllGame: false,
+    scene: "SCENE_GENERAL",
+    language: undefined
+  });
+  assert.deepEqual(postSearch.structuredContent.filters, {
+    order_type: 2,
+    order: "latest",
+    author_type: 1,
+    author: "official"
+  });
 
-  const wikiSearch = await client.callTool({ name: "search_hoyowiki", arguments: { keyword: "Mavuika" } });
+  const wikiSearch = await client.callTool({ name: "search_hoyowiki", arguments: { keyword: "Mavuika", order_type: 2, author_type: 2 } });
   assert.match(wikiSearch.content.find((item) => item.type === "text")?.text || "", /entry_page_id: 7299/);
   assert.equal(wikiSearch.structuredContent.entry_pages[0].entry_page_id, "7299");
   assert.equal(wikiSearch.structuredContent.entry_pages[0].wiki_app, "genshin");
+  assert.equal(searchCalls.wiki[0].orderType, 2);
+  assert.equal(searchCalls.wiki[0].authorType, 2);
+  assert.deepEqual(wikiSearch.structuredContent.filters, {
+    order_type: 2,
+    order: "latest",
+    author_type: 2,
+    author: "authenticated"
+  });
 
   const article = await client.callTool({ name: "read_hoyolab_article", arguments: { post_id: "123" } });
   const articleText = article.content.find((item) => item.type === "text")?.text || "";
@@ -143,6 +204,9 @@ test("MCP exposes MDX article and Wiki tools over the protocol", async () => {
   assert.equal(article.structuredContent.format, "mdx");
   assert.match(article.structuredContent.mdx, /# Article: Example article/);
   assert.equal(article.structuredContent.mdx, articleText);
+  assert.equal(article.structuredContent.language, "ja-jp");
+  assert.equal(article.structuredContent.api_origin_lang, "en-us");
+  assert.deepEqual(article.structuredContent.available_languages, ["en-us", "ja-jp"]);
 
   const wiki = await client.callTool({ name: "read_hoyowiki_entry", arguments: { entry_page_id: "49" } });
   const wikiText = wiki.content.find((item) => item.type === "text")?.text || "";
@@ -165,11 +229,13 @@ test("MCP exposes MDX article and Wiki tools over the protocol", async () => {
   const moduleText = module.content.find((item) => item.type === "text")?.text || "";
   assert.match(moduleText, /## 1\. Attributes/);
   assert.equal(module.structuredContent.scope, "module");
+  assert.equal(module.structuredContent.language, "ja-jp");
 
   const component = await client.callTool({ name: "read_hoyowiki_component", arguments: { entry_page_id: "49", module: "1", component: "component[1]" } });
   const componentText = component.content.find((item) => item.type === "text")?.text || "";
   assert.match(componentText, /### 1\.1\. Base Info/);
   assert.equal(component.structuredContent.scope, "component");
+  assert.equal(component.structuredContent.language, "ja-jp");
   assert.equal(component.structuredContent.mdx, componentText);
 
   const replies = await client.callTool({ name: "read_hoyolab_replies", arguments: { post_id: "123", size: 2 } });
@@ -181,6 +247,8 @@ test("MCP exposes MDX article and Wiki tools over the protocol", async () => {
   assert.equal(replies.structuredContent.markdown, repliesText);
   assert.equal(replies.structuredContent.replies.length, 2);
   assert.equal(replies.structuredContent.replies[0].body_source, "quill-delta");
+  assert.equal(replies.structuredContent.replies[0].language, "ja-jp");
+  assert.deepEqual(replies.structuredContent.languages, ["ja-jp"]);
 
   await client.close();
   await server.close();

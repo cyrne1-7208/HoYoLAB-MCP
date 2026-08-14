@@ -108,19 +108,25 @@ async function checkGame(game) {
     keyword: game.keyword,
     game_id: game.gameId,
     page_size: 5,
+    order_type: 2,
+    author_type: 0,
     language: game.language
   }, `search_hoyolab_posts:${game.name}`);
   const postResults = postSearch.structuredContent?.results || [];
   requireValue(postResults.some((result) => /^\d+$/.test(result?.post_id || "")), `${game.name} post search returned no numeric post ID`);
+  requireValue(postSearch.structuredContent?.filters?.order === "latest", `${game.name} post search did not preserve latest sort`);
 
   const wikiSearch = await callTool("search_hoyowiki", {
     keyword: game.keyword,
     game_id: game.gameId,
     page_size: 5,
+    order_type: 0,
+    author_type: 0,
     language: game.language
   }, `search_hoyowiki:${game.name}`);
   const entryResults = wikiSearch.structuredContent?.entry_pages || [];
   requireValue(entryResults.some((entry) => /^\d+$/.test(entry?.entry_page_id || "")), `${game.name} Wiki search returned no numeric entry ID`);
+  requireValue(wikiSearch.structuredContent?.filters?.order === "relevance", `${game.name} Wiki search did not preserve default sort`);
 
   const article = await findArticle(postResults, game);
   const wiki = await findWikiEntry(entryResults, game);
