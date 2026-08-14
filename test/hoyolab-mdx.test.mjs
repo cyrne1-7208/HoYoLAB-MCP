@@ -308,6 +308,10 @@ test("numbers and scopes Wiki hierarchy elements", () => {
   assert.match(scoped, /## 1\. Details/);
   assert.match(scoped, /### 1\.1\. Customize/);
   assert.match(scoped, /#### 1\.1\.1\. /);
+  assert.throws(
+    () => wikiLocationToMdx(payload, { wikiApp: "genshin" }, { module: "module[1]", component: "module[2].component[1]" }),
+    /does not belong to module\[1\]/
+  );
 });
 
 test("converts Wiki HTML tables without leaving raw HTML tags", () => {

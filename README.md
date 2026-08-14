@@ -1,8 +1,9 @@
-# HoYoLAB read-only MCP server
+# HoYoLAB MCP server
 
 公開HoYoLAB／HoYoWiki APIを読み取り専用のMCPツールとして提供します。記事本文はMDX風Markdownへ変換し、HTML、Quill Delta、旧形式のJSON本文、段落、表、画像、動画を扱います。
 
-ライセンスは [GNU AGPL v3以降](LICENSE) です。
+> [!CAUTION]
+> 本プロジェクトはHoYoLAB、HoYoWiki、HoYoverseの公式プロジェクトではありません。これらのサービスや関連会社とは提携、承認、支援その他の公式な関係はありません。利用時は各サービスの利用規約および関連ポリシーを確認してください。
 
 ## セットアップ
 
@@ -66,4 +67,13 @@ HOYOLAB_API_TIMEOUT_MS=20000
 
 記事取得結果は、`content[0].text`と`structuredContent.mdx`に同じ完全な本文を返します。返信取得結果は、`content[0].text`と`structuredContent.markdown`にMarkdownを返し、返信単位の本文・投稿者・日時・親子関係を`structuredContent.replies`で返します。
 
-Wikiの階層番号は1始まりです。例えば`1.2.`は`module[1].component[2]`で直接取得できます。
+Wikiの階層番号は1始まりです。例えば`1.2.`は1番目のModuleに属する2番目のComponentで、場所は`module[1].component[2]`です。`module[...]`と`module[...].component[...]`は階層取得結果から直接取得ツールへ渡せます。`item[...]`はComponent内の項目位置を示す情報で、取得時は親Componentを指定します。
+
+## 生成AIによる開発支援の表記
+
+- 使用した生成AIモデル: GPT‑5.6 Luna
+  - 活用範囲: HoYoLAB API仕様の調査、実装方針の検討、コードの作成・修正、テストの設計・検証、ドキュメントの作成
+
+## ライセンス
+
+本プロジェクトは [GNU AGPL v3以降](LICENSE) の条件で提供されます。

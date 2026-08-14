@@ -1162,12 +1162,17 @@ function resolveWikiModule(page, selector) {
   throw new Error(`Unknown module selector '${value}'. Available modules: ${available || "none"}`);
 }
 
-function resolveWikiComponent(module, selector) {
+function resolveWikiComponent(module, selector, expectedModuleIndex) {
   const value = selectorValue(selector, "component");
   const components = module?.components || [];
-  const indexSelector = value.match(/^(?:module\[\d+\]\.)?component\[(\d+)\]$/i) || value.match(/^(\d+)$/);
-  if (indexSelector) {
-    const index = Number(indexSelector[1]) - 1;
+  const pathSelector = value.match(/^module\[(\d+)\]\.component\[(\d+)\]$/i);
+  const indexSelector = value.match(/^component\[(\d+)\]$/i) || value.match(/^(\d+)$/);
+  if (pathSelector && expectedModuleIndex !== undefined && Number(pathSelector[1]) !== expectedModuleIndex) {
+    throw new Error(`Component selector '${value}' does not belong to module[${expectedModuleIndex}]`);
+  }
+  const componentIndex = pathSelector ? Number(pathSelector[2]) : indexSelector ? Number(indexSelector[1]) : undefined;
+  if (componentIndex !== undefined) {
+    const index = componentIndex - 1;
     if (components[index]) return { component: components[index], index };
   }
   const normalized = value.toLocaleLowerCase();
@@ -1207,7 +1212,7 @@ export function wikiLocationToMdx(payload, options = {}, selectors = {}) {
   const moduleTitle = wikiModuleTitle(moduleResult.module, moduleNumber);
   const componentResults = selectors.component === undefined || selectors.component === null
     ? (moduleResult.module.components || []).map((component, index) => ({ component, index }))
-    : [resolveWikiComponent(moduleResult.module, selectors.component)];
+    : [resolveWikiComponent(moduleResult.module, selectors.component, moduleNumber)];
   const componentBlocks = componentResults.map(({ component, index }) => {
     const componentNumber = index + 1;
     const componentTitle = wikiComponentTitle(component);
