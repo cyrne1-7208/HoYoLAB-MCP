@@ -2,17 +2,22 @@
   "name": "hoyolab-mcp",
   "version": "0.1.0",
   "private": true,
-  "description": "Read-only HoYoLAB and HoYoWiki MCP server",
+  "description": "HoYoLAB and HoYoWiki MCP server with structured search and targeted MDX retrieval",
   "license": "AGPL-3.0-or-later",
   "type": "module",
+  "engines": {
+    "node": ">=20"
+  },
   "scripts": {
     "mcp:server": "node scripts/mcp-server.mjs",
     "mcp:check": "node scripts/check-hoyolab-mcp.mjs",
     "mcp:check:games": "node scripts/check-hoyolab-games.mjs",
-    "test": "node --test"
+    "mcp:check:regressions": "node scripts/check-hoyolab-regressions.mjs",
+    "mcp:check:corpus": "node scripts/check-hoyolab-corpus.mjs",
+    "test": "node --test test/*.test.mjs"
   },
   "dependencies": {
-    "@modelcontextprotocol/sdk": "^1.27.1",
+    "@modelcontextprotocol/sdk": "^1.31.0",
     "dotenv": "^17.2.2",
     "turndown": "^7.2.4",
     "turndown-plugin-gfm": "^1.0.2",

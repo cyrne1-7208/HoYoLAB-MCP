@@ -75,6 +75,7 @@ test("MCP exposes MDX article and Wiki tools over the protocol", async () => {
     data: {
       page: {
         id: "49",
+        status: 2,
         name: "Raiden Shogun",
         desc: "Her Excellency.",
         modules: [{
@@ -166,7 +167,9 @@ test("MCP exposes MDX article and Wiki tools over the protocol", async () => {
   const postSearch = await client.callTool({ name: "search_hoyolab_posts", arguments: { keyword: "Search", order_type: 2, author_type: 1 } });
   assert.match(postSearch.content.find((item) => item.type === "text")?.text || "", /post_id: 456/);
   assert.equal(postSearch.structuredContent.results[0].post_id, "456");
-  assert.deepEqual(searchCalls.posts[0], {
+  assert.ok(searchCalls.posts[0].signal instanceof AbortSignal);
+  const { signal, ...postSearchArguments } = searchCalls.posts[0];
+  assert.deepEqual(postSearchArguments, {
     keyword: "Search",
     gameId: undefined,
     page: 1,
@@ -229,13 +232,16 @@ test("MCP exposes MDX article and Wiki tools over the protocol", async () => {
   const moduleText = module.content.find((item) => item.type === "text")?.text || "";
   assert.match(moduleText, /## 1\. Attributes/);
   assert.equal(module.structuredContent.scope, "module");
-  assert.equal(module.structuredContent.language, "ja-jp");
+  assert.equal(module.structuredContent.requested_language, "ja-jp");
+  assert.equal(module.structuredContent.actual_language, undefined);
+  assert.equal(module.structuredContent.language_status, "unknown");
 
   const component = await client.callTool({ name: "read_hoyowiki_component", arguments: { entry_page_id: "49", module: "1", component: "component[1]" } });
   const componentText = component.content.find((item) => item.type === "text")?.text || "";
   assert.match(componentText, /### 1\.1\. Base Info/);
   assert.equal(component.structuredContent.scope, "component");
-  assert.equal(component.structuredContent.language, "ja-jp");
+  assert.equal(component.structuredContent.requested_language, "ja-jp");
+  assert.equal(component.structuredContent.actual_language, undefined);
   assert.equal(component.structuredContent.mdx, componentText);
 
   const replies = await client.callTool({ name: "read_hoyolab_replies", arguments: { post_id: "123", size: 2 } });

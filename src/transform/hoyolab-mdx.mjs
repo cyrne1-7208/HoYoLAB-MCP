@@ -1,6 +1,8 @@
 import YAML from "yaml";
 import TurndownService from "turndown";
 import { gfm } from "turndown-plugin-gfm";
+import { HoYoLabApiError } from "../hoyolab/api.mjs";
+import { openingFence, isClosingFence, escapeMarkdownText, markdownLink } from "./markdown-syntax.mjs";
 
 const turndown = new TurndownService({
   headingStyle: "atx",
@@ -12,11 +14,26 @@ const turndown = new TurndownService({
 });
 
 turndown.use(gfm);
+turndown.addRule("hoyolabSafeLink", {
+  filter: "a",
+  replacement: (content, node) => {
+    const url = safeUrl(node.getAttribute("href"));
+    return url ? markdownLink(content || url, url, { formattedLabel: Boolean(content) }) : content;
+  }
+});
+turndown.addRule("hoyolabSafeImage", {
+  filter: "img",
+  replacement: (_content, node) => {
+    const url = safeUrl(node.getAttribute("src"));
+    const label = node.getAttribute("alt") || node.getAttribute("title") || "Image";
+    return url ? markdownLink(label, url, { image: true }) : escapeMarkdownText(label);
+  }
+});
 turndown.addRule("hoyolabIframe", {
   filter: "iframe",
   replacement: (_content, node) => {
     const url = safeUrl(node.getAttribute("src"));
-    return url ? `\n[Video](${url})\n` : "";
+    return url ? `\n${markdownLink("Video", url)}\n` : "";
   }
 });
 turndown.addRule("hoyolabTable", {
@@ -27,7 +44,9 @@ turndown.remove(["script", "style", "noscript", "template", "object", "embed", "
 
 const INTERNAL_KEYS = /^(id|uid|suid|post_id|game_id|component_id|layout|style|origin_module_id|is_poped|is_customize_name|is_abstract|is_show_switch|switch|repeated|is_submodule|without_border|can_delete|is_hidden|rich_text_editing)$/i;
 const HTML_VALUE = /<\/?[a-z][a-z0-9-]*(?:\s[^>]*|\/?\s*)>/i;
-const LOCALE_PLACEHOLDER = /^[a-z]{2,3}(?:[-_][a-z]{2,4})?$/i;
+const LOCALE_PLACEHOLDERS = new Set(["zh-cn", "zh-tw", "de-de", "en-us", "es-es", "fr-fr", "id-id", "it-it", "ja-jp", "ko-kr", "pt-pt", "ru-ru", "th-th", "tr-tr", "vi-vn"]);
+const MAX_CONTENT_DEPTH = 64;
+const MAX_CONTENT_NODES = 50000;
 
 // Keep transport metadata in frontmatter while rendering only fields that describe the readable document.
 
@@ -35,20 +54,54 @@ function isObject(value) {
   return value !== null && typeof value === "object";
 }
 
+function assertContentComplexity(value) {
+  const stack = [[value, 0]];
+  let nodes = 0;
+  while (stack.length) {
+    const [current, depth] = stack.pop();
+    if (++nodes > MAX_CONTENT_NODES || depth > MAX_CONTENT_DEPTH) throw new HoYoLabApiError("Structured content exceeds the depth or node processing limit", { code: "DOCUMENT_TOO_COMPLEX" });
+    if (isObject(current)) for (const item of Object.values(current)) stack.push([item, depth + 1]);
+  }
+}
+
+function conversionWarning(options, code, path, message) {
+  const warning = { code, path: path || options.sourcePath || "body", message };
+  if (options.warnings && options.warnings.length < 128 && !options.warnings.some((item) => item.code === code && item.path === warning.path)) options.warnings.push(warning);
+}
+
+// Recover readable values from new upstream widgets without treating their text as server instructions.
+function fallbackContent(value, options = {}, depth = 0) {
+  if (depth > MAX_CONTENT_DEPTH) throw new HoYoLabApiError("Fallback content exceeds the depth processing limit", { code: "DOCUMENT_TOO_COMPLEX" });
+  if (value == null) return "";
+  if (typeof value === "string") return htmlToMarkdown(value, options);
+  if (typeof value === "number" || typeof value === "boolean") return String(value);
+  if (Array.isArray(value)) return value.map((item) => fallbackContent(item, options, depth + 1)).filter(Boolean).join("\n\n");
+  if (!isObject(value)) return "";
+  return Object.entries(value).filter(([key]) => !INTERNAL_KEYS.test(key) && !/^(type|kind|block_type)$/i.test(key))
+    .map(([key, item]) => {
+      const text = fallbackContent(item, options, depth + 1);
+      return text ? `**${humanizeKey(key)}:** ${text}` : "";
+    }).filter(Boolean).join("\n\n");
+}
+
 function compactMetadata(metadata) {
-  return Object.fromEntries(
+  const compacted = Object.fromEntries(
     Object.entries(metadata).filter(([, value]) => {
       if (value === undefined || value === null || value === "") return false;
       if (Array.isArray(value) && value.length === 0) return false;
       return true;
     })
   );
+  // Retained metadata also reaches YAML and revision hashing; bound it before either recursive serializer runs.
+  assertContentComplexity(compacted);
+  return compacted;
 }
 
 function epochToIso(value) {
   const number = Number(value);
   if (!Number.isFinite(number) || number <= 0) return undefined;
-  return new Date(number * 1000).toISOString();
+  const date = new Date(number * 1000);
+  return Number.isFinite(date.getTime()) ? date.toISOString() : undefined;
 }
 
 function frontmatter(metadata) {
@@ -60,18 +113,41 @@ function indentBlock(value, prefix = "  ") {
 }
 
 export function cleanMarkdown(value) {
-  return String(value ?? "")
-    .replace(/\r\n?/g, "\n")
+  return mapMarkdownProse(String(value ?? "").replace(/\r\n?/g, "\n"), (text) => text
     .replace(/\u00a0/g, " ")
     .replace(/^[ \t]+$/gm, "")
-    .replace(/\n{3,}/g, "\n\n")
-    .trim();
+    .replace(/\n{3,}/g, "\n\n")).trim();
+}
+
+// Keep literal code out of prose cleanup, heading numbering and hierarchy extraction.
+function mapMarkdownProse(value, transform) {
+  const result = [];
+  let pending = [];
+  let fenced;
+  const flush = () => { if (pending.length) { result.push(transform(pending.join("\n"))); pending = []; } };
+  for (const line of String(value ?? "").split("\n")) {
+    const mark = !fenced && openingFence(line);
+    if (mark || fenced) {
+      flush(); result.push(line);
+      if (mark) fenced = mark;
+      else if (isClosingFence(line, fenced)) fenced = undefined;
+    } else pending.push(line);
+  }
+  flush();
+  return result.join("\n");
 }
 
 function stripResidualHtml(value) {
-  return String(value ?? "")
-    .replace(/<!--[\s\S]*?-->/g, "")
-    .replace(/<\/?[a-z][a-z0-9-]*(?:\s[^>]*|\/?\s*)>/gi, "");
+  const strip = (text) => text.replace(/<!--[\s\S]*?-->/g, "").replace(/<\/?[a-z][a-z0-9-]*(?:\s[^>]*|\/?\s*)>/gi, "");
+  return mapMarkdownProse(value, (text) => {
+    let output = "";
+    let start = 0;
+    for (const match of text.matchAll(/(?<![\\`])(`+)([\s\S]*?)\1(?!`)/g)) {
+      output += strip(text.slice(start, match.index)) + match[0];
+      start = match.index + match[0].length;
+    }
+    return output + strip(text.slice(start));
+  });
 }
 
 function scopedHeading(title, context = {}) {
@@ -81,6 +157,7 @@ function scopedHeading(title, context = {}) {
 }
 
 function hierarchyItemNumber(context = {}, itemIndex = context.itemIndex) {
+  if (context.numberItems === false) return "";
   const indexes = [context.moduleIndex, context.componentIndex, itemIndex];
   return indexes.every((value) => Number.isInteger(value) && value > 0) ? indexes.join(".") : "";
 }
@@ -100,21 +177,40 @@ function numberedItemHeading(title, context = {}) {
 function numberMarkdownItems(value, context = {}) {
   if (!hierarchyItemNumber(context, 1)) return value;
   let itemIndex = 0;
-  return String(value).replace(/^(#{1,6})\s+(.+)$/gm, (_match, hashes, title) => {
+  return mapMarkdownProse(value, (text) => text.replace(/^(#{1,6})\s+(.+)$/gm, (_match, hashes, title) => {
     itemIndex += 1;
     return `${hashes} ${hierarchyItemPrefix(context, itemIndex)}${title.trim()}`;
-  });
+  }));
+}
+
+function markdownHeadings(value) {
+  const titles = [];
+  mapMarkdownProse(value, (text) => { for (const match of text.matchAll(/^#{1,6}\s+(.+)$/gm)) titles.push(match[1].trim()); return text; });
+  return titles;
 }
 
 function nestArticleBody(value) {
-  return String(value ?? "").replace(/^(#{1,6})\s+(.+)$/gm, (_match, hashes, title) => {
-    const level = Math.min(6, hashes.length + 1);
-    const label = hashes.length <= 2 ? "Section" : "Subsection";
-    return `${"#".repeat(level)} ${label}: ${title.trim()}`;
-  });
+  return mapMarkdownProse(value, (text) => text.replace(/^(#{1,6})\s+(.+)$/gm, (_match, hashes, title) => {
+      const level = Math.min(6, hashes.length + 1);
+      const label = hashes.length <= 2 ? "Section" : "Subsection";
+      return `${"#".repeat(level)} ${label}: ${title.trim()}`;
+    }));
 }
 
-function safeUrl(value) {
+function nestWikiBody(value, ownerLevel) {
+  let minimum = 7;
+  mapMarkdownProse(value, (text) => {
+    for (const match of text.matchAll(/^(#{1,6})\s+/gm)) minimum = Math.min(minimum, match[1].length);
+    return text;
+  });
+  const offset = Math.max(0, ownerLevel + 1 - minimum);
+  if (!offset) return value;
+  // Embedded headings belong to their source owner even when the upstream HTML starts at h1/h2.
+  return mapMarkdownProse(value, (text) => text.replace(/^(#{1,6})(\s+)/gm,
+    (_match, hashes, space) => "#".repeat(Math.min(6, hashes.length + offset)) + space));
+}
+
+export function safeUrl(value) {
   if (typeof value !== "string") return "";
   try {
     const url = new URL(value.trim());
@@ -202,14 +298,14 @@ export function cleanTitle(value) {
 }
 
 function parseMaybeJson(value) {
-  if (typeof value !== "string") return value;
-  const text = value.trim();
-  if (!text) return null;
-  try {
-    return JSON.parse(text);
-  } catch {
-    return value;
+  let parsed = value;
+  if (typeof value === "string") {
+    const text = value.trim();
+    if (!text) return null;
+    try { parsed = JSON.parse(text); } catch { return value; }
   }
+  assertContentComplexity(parsed);
+  return parsed;
 }
 
 function humanizeKey(value) {
@@ -251,6 +347,22 @@ function articleTextValue(value, options = {}) {
   return "";
 }
 
+function tableCellValue(value, options = {}, path = "table.cell") {
+  if (!isObject(value)) return articleTextValue(value, options);
+  conversionWarning(options, "UNSUPPORTED_TABLE_CELL", path, "A structured cell was retained as readable fallback text.");
+  return fallbackContent(value, options);
+}
+
+function articleTableExtras(value, handled, options, path) {
+  return Object.entries(value).filter(([key]) => !handled.has(key) && !INTERNAL_KEYS.test(key) && !/^(type|kind|block_type)$/i.test(key))
+    .map(([key, item]) => {
+      const text = fallbackContent(item, options);
+      if (!text) return "";
+      conversionWarning(options, "UNRECOGNIZED_TABLE_FIELD", `${options.sourcePath || "table"}.${path}.${key}`, "Additional table information was retained with its source owner.");
+      return `**${path} — ${humanizeKey(key)}:** ${text}`;
+    }).filter(Boolean);
+}
+
 function articleMediaUrl(value) {
   if (typeof value === "string") return safeUrl(value);
   if (!isObject(value)) return "";
@@ -261,12 +373,27 @@ function articleMediaMarkdown(value, kind = "image", options = {}) {
   const values = Array.isArray(value) ? value : [value];
   return values.map((item) => {
     const url = articleMediaUrl(item);
-    if (!url) return "";
-    const title = isObject(item)
-      ? articleTextValue(item.alt || item.name || item.title || item.description, options)
-      : "";
-    if (kind === "video") return `[${title || "Video"}](${url})`;
-    return `![${title || "Image"}](${url})`;
+    if (!url) {
+      const text = isObject(item) ? fallbackContent(item, options) : "";
+      if (text) conversionWarning(options, "UNSUPPORTED_MEDIA_ITEM", options.sourcePath, "Media without a usable URL was retained as readable fallback text.");
+      return text;
+    }
+    const handled = new Set();
+    if (isObject(item)) for (const key of ["url", "image_url", "img_url", "src", "image", "img", "video"]) {
+      if (safeUrl(item[key]) === url) handled.add(key);
+    }
+    const titleValues = isObject(item) ? ["alt", "name", "title", "description"].map((key) => ({ key, text: articleTextValue(item[key], options) })) : [];
+    const title = titleValues.find((value) => value.text)?.text || (kind === "video" ? "Video" : "Image");
+    for (const value of titleValues) if (value.text === title) handled.add(value.key);
+    const link = markdownLink(title, url, { image: kind !== "video" });
+    const extras = isObject(item) ? Object.entries(item).filter(([key]) => !handled.has(key) && !INTERNAL_KEYS.test(key))
+      .map(([key, value]) => {
+        const text = fallbackContent(value, options);
+        if (!text) return "";
+        conversionWarning(options, "UNRECOGNIZED_MEDIA_FIELD", `${options.sourcePath || "media"}.${key}`, "Additional media information was retained beside its source reference.");
+        return `**${humanizeKey(key)}:** ${text}`;
+      }).filter(Boolean) : [];
+    return [link, ...extras].join("\n\n");
   }).filter(Boolean).join("\n\n");
 }
 
@@ -290,21 +417,44 @@ function articleTableMarkdown(value, options = {}) {
 
   const headerValues = table.headers || table.header || table.columns;
   const rowValues = table.rows || table.body || table.data || table.items;
-  if (!Array.isArray(headerValues) || !Array.isArray(rowValues) || headerValues.length < 2 || rowValues.length < 1) return "";
+  if (!Array.isArray(headerValues) || !Array.isArray(rowValues) || headerValues.length < 1) return "";
 
   const headers = headerValues.map((header, index) => tableColumnName(header, index, options));
   const columns = headerValues.map((header, index) => tableColumnKey(header, index));
-  const rows = rowValues.map((row) => {
-    if (Array.isArray(row)) return row.map((cell) => articleTextValue(cell, options));
+  const extras = [];
+  const rows = rowValues.map((row, rowIndex) => {
+    const rowPath = `Row ${rowIndex + 1}`;
+    if (Array.isArray(row)) return row.map((cell, index) => tableCellValue(cell, options, `${options.sourcePath || "table"}.${rowPath}.cell[${index + 1}]`));
     if (!isObject(row)) return [articleTextValue(row, options)];
-    return columns.map((column, index) => {
-      const valueByKey = row[column] ?? row[String(column)] ?? row[index];
-      return articleTextValue(valueByKey, options);
+    const handled = new Set();
+    const cells = columns.map((column, index) => {
+      const key = [String(column), String(index)].find((key) => row[key] != null);
+      if (key !== undefined) handled.add(key);
+      return tableCellValue(key === undefined ? undefined : row[key], options, `${options.sourcePath || "table"}.${rowPath}.cell[${index + 1}]`);
     });
+    extras.push(...articleTableExtras(row, handled, options, rowPath));
+    return cells;
   });
 
-  if (!headers.every(Boolean) || rows.some((row) => row.length < 2)) return "";
-  return renderMarkdownTable(headers, rows);
+  if (!headers.every(Boolean)) return "";
+  const headerKey = ["headers", "header", "columns"].find((key) => table[key]);
+  const rowKey = ["rows", "body", "data", "items"].find((key) => table[key]);
+  for (const [index, header] of headerValues.entries()) if (isObject(header)) extras.push(...articleTableExtras(header, new Set(["label", "name", "title", "key", "id"]), options, `Column ${index + 1}`));
+  extras.push(...articleTableExtras(table, new Set([headerKey, rowKey]), options, "Table"));
+  return [renderMarkdownTable(headers, rows), ...extras].join("\n\n");
+}
+
+function articleTablesMarkdown(value, options = {}, path = "body.table") {
+  const values = Array.isArray(value) ? value : [value];
+  return values.map((item, index) => {
+    const parsed = parseMaybeJson(item);
+    if (parsed == null || parsed === "") return "";
+    const location = Array.isArray(value) ? `${path}[${index + 1}]` : path;
+    const table = articleTableMarkdown(parsed, { ...options, sourcePath: location });
+    if (table) return table;
+    conversionWarning(options, "UNSUPPORTED_ARTICLE_TABLE", location, "A structured table could not be rendered as rows; readable values were retained as fallback text.");
+    return fallbackContent(parsed, options);
+  }).filter(Boolean).join("\n\n");
 }
 
 function renderArticleJsonBlock(value, options = {}) {
@@ -319,58 +469,74 @@ function renderArticleJsonBlock(value, options = {}) {
   if (!isObject(block)) return "";
 
   const type = String(block.type || block.kind || block.block_type || "").toLocaleLowerCase();
+  const parts = [];
+  const handled = new Set(["type", "kind", "block_type"]);
+  const add = (value) => { if (value && !parts.includes(value)) parts.push(value); };
   if (type.includes("table") || block.table !== undefined) {
-    const table = articleTableMarkdown(block.table || block, options);
-    if (table) return table;
+    const source = block.table || block;
+    const table = articleTableMarkdown(source, options);
+    if (table) {
+      add(table);
+      if (source === block) {
+        for (const key of Object.keys(block)) handled.add(key);
+      } else handled.add("table");
+    }
   }
   if (type.includes("image") || type === "img") {
     const image = articleMediaMarkdown(block.image || block.img || block.url || block.src || block, "image", options);
-    if (image) return image;
+    if (image) { add(image); for (const key of ["image", "img", "url", "src"]) handled.add(key); }
   }
   if (type.includes("video")) {
     const video = articleMediaMarkdown(block.video || block.url || block.src || block, "video", options);
-    if (video) return video;
+    if (video) { add(video); for (const key of ["video", "url", "src"]) handled.add(key); }
   }
 
   for (const key of ["text", "describe", "description", "html", "value"]) {
-    if (block[key] !== undefined) {
-      const text = articleTextValue(block[key], options);
-      if (text) return text;
+    if (block[key] !== undefined && !handled.has(key)) {
+      const text = isObject(block[key]) ? fallbackContent(block[key], options) : articleTextValue(block[key], options);
+      if (isObject(block[key])) conversionWarning(options, "UNSUPPORTED_ARTICLE_BLOCK", `${options.sourcePath || "body"}.${key}`, "Structured text was retained as fallback content.");
+      add(text); handled.add(key);
     }
   }
   for (const key of ["content", "children", "blocks", "sections", "paragraphs"]) {
-    if (block[key] !== undefined) {
+    if (block[key] !== undefined && !handled.has(key)) {
       const nested = renderArticleJsonBlock(block[key], options);
-      if (nested) return nested;
+      add(nested); handled.add(key);
     }
   }
   for (const key of ["table", "tables", "data_table"]) {
-    if (block[key] !== undefined) {
-      const table = Array.isArray(block[key])
-        ? block[key].map((item) => articleTableMarkdown(item, options)).filter(Boolean).join("\n\n")
-        : articleTableMarkdown(block[key], options);
-      if (table) return table;
+    if (block[key] !== undefined && !handled.has(key)) {
+      const table = articleTablesMarkdown(block[key], options, `${options.sourcePath || "body"}.${key}`);
+      if (table) { add(table); handled.add(key); }
     }
   }
   for (const key of ["image", "img", "images", "imgs", "gallery"]) {
-    if (block[key] !== undefined) {
+    if (block[key] !== undefined && !handled.has(key)) {
       const image = articleMediaMarkdown(block[key], "image", options);
-      if (image) return image;
+      if (image) { add(image); handled.add(key); }
     }
   }
   for (const key of ["video", "videos"]) {
-    if (block[key] !== undefined) {
+    if (block[key] !== undefined && !handled.has(key)) {
       const video = articleMediaMarkdown(block[key], "video", options);
-      if (video) return video;
+      if (video) { add(video); handled.add(key); }
     }
   }
-  return "";
+  for (const [key, value] of Object.entries(block)) {
+    if (handled.has(key) || INTERNAL_KEYS.test(key)) continue;
+    const text = fallbackContent(value, options);
+    if (!text) continue;
+    conversionWarning(options, "UNSUPPORTED_ARTICLE_BLOCK", `${options.sourcePath || type || "body"}.${key}`, "An article block used fallback text extraction; its original presentation may be incomplete.");
+    add(`**${humanizeKey(key)}:** ${text}`);
+  }
+  return parts.join("\n\n");
 }
 
 function articleJsonToMarkdown(value, options = {}) {
   // Legacy article bodies store readable text and media under describe, imgs, and video keys instead of HTML.
   const parsed = parseMaybeJson(value);
   if (!isObject(parsed)) return "";
+  if (deltaOps(parsed)) return "";
 
   if (Array.isArray(parsed)) return cleanMarkdown(renderArticleJsonBlock(parsed, options));
 
@@ -389,9 +555,7 @@ function articleJsonToMarkdown(value, options = {}) {
   }
   for (const key of ["table", "tables", "data_table"]) {
     if (parsed[key] !== undefined) {
-      const table = Array.isArray(parsed[key])
-        ? parsed[key].map((item) => articleTableMarkdown(item, options)).filter(Boolean).join("\n\n")
-        : articleTableMarkdown(parsed[key], options);
+      const table = articleTablesMarkdown(parsed[key], options, `${options.sourcePath || "body"}.${key}`);
       if (table) parts.push(table);
     }
   }
@@ -408,10 +572,24 @@ function articleJsonToMarkdown(value, options = {}) {
     }
   }
 
+  const known = new Set(["describe", "description", "body", "text", "html", "content", "blocks", "sections", "paragraphs", "table", "tables", "data_table", "image", "img", "images", "imgs", "gallery", "video", "videos", "type", "kind", "block_type"]);
+  // Delta is decoded separately; do not render its protocol fields as ordinary article text.
+  if (!parts.length && deltaOps(parsed)) return "";
+  for (const [key, value] of Object.entries(parsed)) {
+    if (known.has(key) || INTERNAL_KEYS.test(key)) continue;
+    const recovered = fallbackContent(value, options);
+    if (!recovered) continue;
+    conversionWarning(options, "UNRECOGNIZED_ARTICLE_FIELD", key, "An additional article field used generic text extraction.");
+    parts.push(`**${humanizeKey(key)}:** ${recovered}`);
+  }
+
   return cleanMarkdown(parts.join("\n\n"));
 }
 
 function htmlTableToMarkdown(node) {
+  const captionNode = Array.from(node.children).find((child) => child.tagName === "CAPTION");
+  const caption = captionNode ? stripResidualHtml(cleanMarkdown(turndown.turndown(captionNode.innerHTML))) : "";
+  const prefix = caption ? `\n**Caption:** ${caption}\n\n` : "\n";
   const rows = Array.from(node.querySelectorAll("tr"))
     .filter((row) => row.closest("table") === node)
     .map((row) => {
@@ -442,7 +620,7 @@ function htmlTableToMarkdown(node) {
     })
     .filter((row) => row.values.length > 0);
 
-  if (!rows.length) return "";
+  if (!rows.length) return caption ? prefix : "";
 
   const values = rows.map((row) => row.values);
   const width = Math.max(...values.map((row) => row.length));
@@ -465,12 +643,12 @@ function htmlTableToMarkdown(node) {
     const blocks = rows
       .map((row) => row.values.filter(Boolean).join("\n\n"))
       .filter(Boolean);
-    return blocks.length ? `\n${blocks.join("\n\n")}\n` : "";
+    return blocks.length ? `${prefix}${blocks.join("\n\n")}\n` : prefix;
   }
 
   normalized.shift();
 
-  return `\n${renderMarkdownTable(headers, normalized)}\n`;
+  return `${prefix}${renderMarkdownTable(headers, normalized)}\n`;
 }
 
 function parseEmbeddedItem(value) {
@@ -496,7 +674,7 @@ function renderEmbeddedItems(value, context = {}) {
     const amount = item.amount !== undefined && item.amount !== null && Number(item.amount) > 0
       ? ` ×${item.amount}`
       : "";
-    return url ? `[${label}](${url})${amount}` : `${label}${amount}`;
+    return url ? `${markdownLink(label, url)}${amount}` : `${label}${amount}`;
   }).filter(Boolean).join(", ");
 }
 
@@ -534,16 +712,27 @@ function compactValue(value, context = {}) {
   return inlineValue(value, context);
 }
 
+function wikiItemExtras(item, handled, context = {}) {
+  return Object.entries(item).filter(([key]) => !handled.has(key) && !INTERNAL_KEYS.test(key))
+    .map(([key, value]) => {
+      const text = compactValue(value, context);
+      if (!text) return "";
+      conversionWarning(context, "UNRECOGNIZED_ITEM_FIELD", `${context.sourcePath || "item"}.${key}`, "An additional Wiki field was retained using generic rendering.");
+      return `- **${humanizeKey(key)}:** ${text.replace(/\n/g, "\n  ")}`;
+    }).filter(Boolean).join("\n");
+}
+
 function renderKeyValueList(list, context = {}) {
   if (!Array.isArray(list) || list.length === 0) return "";
   if (!list.every((item) => isObject(item) && Object.hasOwn(item, "key") && Object.hasOwn(item, "value"))) return "";
   return list.map((item, index) => {
     const key = inlineValue(item.key, context) || "Value";
     const value = compactValue(item.value, context);
-    if (!value) return "";
+    const extras = wikiItemExtras(item, new Set(["key", "value"]), { ...context, sourcePath: `${context.sourcePath || "list"}[${index + 1}]` });
+    if (!value && !extras) return "";
     const prefix = hierarchyItemPrefix(context, index + 1);
-    if (value.includes("\n")) return `- ${prefix}**${key}:**\n${indentBlock(value)}`;
-    return `- ${prefix}**${key}:** ${value}`;
+    const line = value.includes("\n") ? `- ${prefix}**${key}:**\n${indentBlock(value)}` : `- ${prefix}**${key}:** ${value}`;
+    return line + (extras ? `\n${indentBlock(extras)}` : "");
   }).filter(Boolean).join("\n");
 }
 
@@ -553,10 +742,13 @@ function renderImageList(list, context = {}) {
   return list.map((item, index) => {
     const key = inlineValue(item.key, context) || "Image";
     const url = safeUrl(item.img);
-    const image = url ? `![${key}](${url})` : "";
+    const image = url ? markdownLink(key, url, { image: true }) : "";
     const description = inlineValue(item.imgDesc, context);
-    const detail = [image, description].filter(Boolean).join(" — ");
-    return `- ${hierarchyItemPrefix(context, index + 1)}**${key}:** ${detail || "Unavailable"}`;
+    const fallback = !url ? compactValue(item.img, { ...context, numberItems: false }) : "";
+    if (!url) conversionWarning(context, "UNSUPPORTED_MEDIA_URL", `${context.sourcePath || "list"}[${index + 1}].img`, "An image has no usable HTTP/HTTPS URL; readable image data was retained.");
+    const detail = [image, description, fallback].filter(Boolean).join(" — ");
+    const extras = wikiItemExtras(item, new Set(["key", "img", "imgDesc"]), context);
+    return `- ${hierarchyItemPrefix(context, index + 1)}**${key}:** ${detail || "Unavailable"}` + (extras ? `\n${indentBlock(extras)}` : "");
   }).join("\n");
 }
 
@@ -564,20 +756,30 @@ function renderValuesTable(list, context = {}) {
   if (!Array.isArray(list) || list.length === 0) return "";
   const rows = list.filter((item) => isObject(item) && Array.isArray(item.values));
   if (rows.length === 0) return "";
-  const firstValues = rows[0].values.map((value) => inlineValue(value, context));
+  const cell = (value) => {
+    if (!isObject(value)) return inlineValue(value, context);
+    conversionWarning(context, "UNSUPPORTED_TABLE_CELL", context.sourcePath || "wiki.table", "A structured Wiki cell was retained as fallback text.");
+    return compactValue(value, context);
+  };
+  const firstValues = rows[0].values.map(cell);
   const headers = [rows[0].key ? inlineValue(rows[0].key, context) : "Field", ...firstValues];
   const dataRows = rows.slice(1).map((item) => [
     inlineValue(item.key, context),
-    ...item.values.map((value) => inlineValue(value, context))
+    ...item.values.map(cell)
   ]);
-  return renderMarkdownTable(headers, dataRows);
+  const extras = rows.map((item, index) => {
+    const text = wikiItemExtras(item, new Set(["key", "values"]), context);
+    return text ? `**${index === 0 ? "Column headings" : `Row ${index}`}**\n\n${text}` : "";
+  }).filter(Boolean);
+  return [renderMarkdownTable(headers, dataRows), ...extras].join("\n\n");
 }
 
 function renderMaterials(materials, context = {}) {
   if (!Array.isArray(materials) || materials.length === 0) return "";
   const values = materials.flatMap((value) => {
     const embedded = renderEmbeddedItems(value, context);
-    return embedded ? [embedded] : [];
+    const text = embedded || compactValue(value, context);
+    return text ? [text] : [];
   });
   return values.length ? `- **Materials:** ${values.join(", ")}` : "";
 }
@@ -585,44 +787,72 @@ function renderMaterials(materials, context = {}) {
 function renderDescriptiveItem(item, context = {}) {
   if (!isObject(item)) return inlineValue(item, context);
   const lines = [];
-  const heading = inlineValue(item.title || item.name || item.key || item.position, context);
-  if (heading) lines.push(numberedItemHeading(heading, context));
+  const handled = new Set();
+  const nestedContext = { ...context, numberItems: false };
+  // Consume only the alias actually rendered; different values in other aliases remain readable extra fields.
+  const choose = (keys, render) => {
+    const values = keys.map((key) => ({ key, text: render(item[key]) }));
+    const chosen = values.find((value) => value.text);
+    if (!chosen) return "";
+    for (const value of values) if (value.text === chosen.text) handled.add(value.key);
+    return chosen.text;
+  };
+  const heading = choose(["title", "name", "key", "position"], (value) => inlineValue(value, nestedContext));
+  const image = choose(["img", "icon_url", "image"], safeUrl);
+  if (image) lines.push(markdownLink(heading || "Image", image, { image: true }));
 
-  const image = safeUrl(item.img || item.icon_url || item.image);
-  if (image) lines.push(`![${heading || "Image"}](${image})`);
-
-  const description = inlineValue(item.desc || item.description || item.imgDesc, context);
+  const description = choose(["desc", "description", "imgDesc"], (value) => compactValue(value, nestedContext));
   if (description) lines.push(description);
 
   if (Array.isArray(item.attributes)) {
-    const table = renderValuesTable(item.attributes, context);
+    const table = renderList(item.attributes, nestedContext);
     if (table) lines.push(table);
+    handled.add("attributes");
   }
   if (Array.isArray(item.combatList)) {
-    const table = renderValuesTable(item.combatList, context);
+    const table = renderList(item.combatList, nestedContext);
     if (table) lines.push(table);
+    handled.add("combatList");
   }
   if (Array.isArray(item.materials)) {
-    const materials = renderMaterials(item.materials, context);
+    const materials = renderMaterials(item.materials, nestedContext);
     if (materials) lines.push(materials);
+    handled.add("materials");
   }
-  if (Array.isArray(item.videos)) {
-    for (const video of item.videos) {
-      const url = safeUrl(video?.url);
-      if (!url) continue;
-      const title = inlineValue(video.title || "Video", context);
-      const duration = video.duration ? ` (${video.duration}s)` : "";
-      lines.push(`- [${title}](${url})${duration}`);
+  for (const [key, label] of [["videos", "Video"], ["audios", "Audio"]]) {
+    if (Array.isArray(item[key])) {
+      const media = renderWikiMediaList(item[key], label, nestedContext);
+      if (media) lines.push(media);
+      handled.add(key);
     }
   }
-  if (Array.isArray(item.audios)) {
-    for (const audio of item.audios) {
-      const url = safeUrl(audio?.url);
-      if (!url) continue;
-      lines.push(`- [${inlineValue(audio.name || "Audio", context)}](${url})`);
+  const extras = wikiItemExtras(item, handled, nestedContext);
+  if (extras) lines.push(extras);
+  const body = lines.join("\n\n");
+  return [heading ? numberedItemHeading(heading, context) : "", nestWikiBody(body, heading ? 4 : 3)].filter(Boolean).join("\n\n");
+}
+
+function renderWikiMediaList(list, label, context) {
+  return list.map((media, index) => {
+    const location = { ...context, sourcePath: `${context.sourcePath || "item"}.${label.toLowerCase()}[${index + 1}]` };
+    if (!isObject(media) || Array.isArray(media)) {
+      const text = compactValue(media, location);
+      if (text) conversionWarning(location, "UNSUPPORTED_MEDIA_ITEM", location.sourcePath, "Unexpected media data was retained as readable text.");
+      return text ? `- **${label}:** ${text}` : "";
     }
-  }
-  return lines.join("\n\n");
+    const url = safeUrl(media.url);
+    const labelKey = label === "Audio" ? ["name", "title"] : ["title", "name"];
+    const titleKey = labelKey.find((key) => inlineValue(media[key], location));
+    const title = titleKey ? inlineValue(media[titleKey], location) : label;
+    const handled = new Set(["url"]);
+    for (const key of labelKey) if (inlineValue(media[key], location) === title) handled.add(key);
+    const duration = inlineValue(media.duration, location);
+    if (duration) handled.add("duration");
+    if (!url) conversionWarning(location, "UNSUPPORTED_MEDIA_URL", `${location.sourcePath}.url`, "A media reference has no usable HTTP/HTTPS URL; its label and notes were retained.");
+    const link = url ? markdownLink(title, url) : `**${title}:** Unavailable`;
+    const extras = wikiItemExtras(media, handled, location);
+    return `- ${link}${duration ? ` (${duration}s)` : ""}` + (extras ? `\n${indentBlock(extras)}` : "");
+  }).filter(Boolean).join("\n");
 }
 
 function renderList(list, context = {}) {
@@ -635,14 +865,21 @@ function renderList(list, context = {}) {
   if (list.every((item) => isObject(item) && Object.hasOwn(item, "key") && Array.isArray(item.combatList))) {
     return list.map((item, index) => {
       const title = inlineValue(item.key, context) || "Level";
-      const table = renderValuesTable(item.combatList, context);
-      const materials = renderMaterials(item.materials, context);
-      return [numberedItemHeading(title, { ...context, itemIndex: index + 1 }), table, materials].filter(Boolean).join("\n\n");
+      const nestedContext = { ...context, numberItems: false };
+      const table = renderList(item.combatList, nestedContext);
+      const materials = renderMaterials(item.materials, nestedContext);
+      const handled = new Set(["key", "combatList"]);
+      if (Array.isArray(item.materials)) handled.add("materials");
+      const extras = wikiItemExtras(item, handled, nestedContext);
+      return [numberedItemHeading(title, { ...context, itemIndex: index + 1 }), nestWikiBody([table, materials, extras].filter(Boolean).join("\n\n"), 4)].filter(Boolean).join("\n\n");
     }).join("\n\n");
   }
 
-  const valuesTable = renderValuesTable(list, context);
-  if (valuesTable && list.some((item) => isObject(item) && Array.isArray(item.values))) return valuesTable;
+  if (list.every((item) => isObject(item) && Array.isArray(item.values))) return renderValuesTable(list, context);
+  if (list.some((item) => isObject(item) && Array.isArray(item.values))) {
+    conversionWarning(context, "UNSUPPORTED_MIXED_WIKI_LIST", context.sourcePath || "wiki.list", "A mixed table-and-description list was retained item by item instead of discarding non-table items.");
+    return list.map((item, index) => renderDescriptiveItem(item, { ...context, itemIndex: index + 1 })).filter(Boolean).join("\n\n");
+  }
 
   if (list.some((item) => isObject(item) && Array.isArray(item.videos))) {
     return list.map((item, index) => renderDescriptiveItem(item, { ...context, itemIndex: index + 1 })).filter(Boolean).join("\n\n");
@@ -664,39 +901,44 @@ function renderStructured(value, context = {}) {
   const current = collapseComponentData(value);
   if (current === undefined || current === null || current === "") return "";
   if (typeof current === "string") return numberMarkdownItems(inlineValue(current, context), context);
+  if (!isObject(current)) return inlineValue(current, context);
 
   if (Array.isArray(current)) return renderList(current, context);
 
   const lines = [];
+  const handled = new Set();
   if (typeof current.pic === "string") {
     const url = safeUrl(current.pic);
-    if (url) lines.push(`![Gallery](${url})`);
+    if (url) { lines.push(markdownLink("Gallery", url, { image: true })); handled.add("pic"); }
   }
 
   if (Array.isArray(current.list)) {
     const listContent = renderList(current.list, context);
     if (listContent) lines.push(listContent);
+    handled.add("list");
   }
 
-  if (isObject(current.artifact_list)) {
+  if (isObject(current.artifact_list) && !Array.isArray(current.artifact_list)) {
     for (const [index, [key, item]] of Object.entries(current.artifact_list).entries()) {
-      const rendered = renderDescriptiveItem(
-        { ...item, position: item.position || humanizeKey(key) },
-        { ...context, itemIndex: index + 1 }
-      );
+      const rendered = isObject(item) && !Array.isArray(item)
+        ? renderDescriptiveItem({ ...item, position: item.position || humanizeKey(key) }, { ...context, itemIndex: index + 1 })
+        : wikiItemExtras({ [key]: item }, new Set(), context);
       if (rendered) lines.push(rendered);
     }
+    handled.add("artifact_list");
   }
 
   if (typeof current.data === "string" && current.data.trim()) {
     const rendered = numberMarkdownItems(htmlToMarkdown(current.data, context), context);
     if (rendered) lines.push(rendered);
+    handled.add("data");
   }
 
   for (const [key, nested] of Object.entries(current)) {
-    if (["list", "pic", "artifact_list", "data"].includes(key) || INTERNAL_KEYS.test(key)) continue;
+    if (handled.has(key) || INTERNAL_KEYS.test(key)) continue;
     const rendered = compactValue(nested, context);
     if (!rendered) continue;
+    if (["list", "pic", "artifact_list", "data"].includes(key)) conversionWarning(context, "UNSUPPORTED_WIKI_FIELD", `${context.sourcePath || "component"}.${key}`, "An unexpected Wiki field shape was retained as readable text.");
     const label = humanizeKey(key);
     if (rendered.includes("\n")) lines.push(`- **${label}:**\n${indentBlock(rendered)}`);
     else lines.push(`- **${label}:** ${rendered}`);
@@ -708,6 +950,8 @@ function renderStructured(value, context = {}) {
 function formatInlineDeltaText(value, attributes = {}) {
   let text = String(value ?? "").replace(/\u200b/g, "");
   if (!text) return "";
+  const link = safeUrl(attributes.link);
+  if (link) text = escapeMarkdownText(text);
 
   if (attributes.code) text = `\`${text.replace(/`/g, "\\`")}\``;
   if (attributes.bold) text = `**${text}**`;
@@ -715,8 +959,7 @@ function formatInlineDeltaText(value, attributes = {}) {
   if (attributes.underline) text = `<u>${text}</u>`;
   if (attributes.strike) text = `~~${text}~~`;
 
-  const link = safeUrl(attributes.link);
-  return link ? `[${text.replace(/\]/g, "\\]")}](${link})` : text;
+  return link ? markdownLink(text, link, { formattedLabel: true }) : text;
 }
 
 function deltaListKind(value) {
@@ -766,24 +1009,43 @@ function renderCardGroup(group) {
     const views = info.view_num ? ` · ${info.view_num} views` : "";
     const suffix = [author, views.replace(/^ · /, "")].filter(Boolean).join(" · ");
     const detail = suffix ? ` — ${suffix}` : "";
-    lines.push(url ? `- [${title}](${url})${detail}` : `- ${title}${detail}`);
+    lines.push(url ? `- ${markdownLink(title, url)}${detail}` : `- ${title}${detail}`);
   }
   return lines.join("\n");
 }
 
-function renderDeltaEmbed(insert) {
+function deltaMediaMarkdown(value, kind, options) {
+  if (Array.isArray(value)) return value.map((item) => deltaMediaMarkdown(item, kind, options)).filter(Boolean).join("\n\n");
+  const media = isObject(value) ? { ...value } : { url: value };
+  const notes = [];
+  // Image captions are often stored on the Delta operation, not inside insert.image. Layout attributes are not caption text.
+  for (const key of ["alt", "name", "title", "description", "caption", "transcript", "text"]) {
+    const attribute = options.deltaAttributes?.[key];
+    const text = articleTextValue(attribute, options);
+    if (!text) continue;
+    const existing = articleTextValue(media[key], options);
+    if (!existing) media[key] = attribute;
+    else if (existing !== text) {
+      notes.push(`**${humanizeKey(key)} (operation):** ${text}`);
+      conversionWarning(options, "UNRECOGNIZED_MEDIA_FIELD", `${options.sourcePath || "delta"}.attributes.${key}`, "Distinct media information on the Delta operation was retained beside the embedded reference.");
+    }
+  }
+  return [articleMediaMarkdown(media, kind, options), ...notes].filter(Boolean).join("\n\n");
+}
+
+function renderDeltaEmbed(insert, options = {}) {
   if (!isObject(insert)) return "";
   if (insert.type === "ContentTypeText" && insert.text !== undefined) {
     return inlineValue(insert.text);
   }
   if (insert.emoticon) {
     const url = safeUrl(insert.emoticon.url || insert.emoticon.image || insert.emoticon.src);
-    if (url) return `![Emoji](${url})`;
+    if (url) return markdownLink("Emoji", url, { image: true });
     return inlineValue(insert.backup?.text || insert.text);
   }
   if (insert.emoji) {
     const url = safeUrl(insert.emoji.url || insert.emoji.image || insert.emoji.src);
-    if (url) return `![Emoji](${url})`;
+    if (url) return markdownLink("Emoji", url, { image: true });
     return inlineValue(insert.emoji.text || insert.backup?.text || insert.text);
   }
   if (insert.mention) {
@@ -794,12 +1056,10 @@ function renderDeltaEmbed(insert) {
   }
   if (insert.backup?.text !== undefined) return inlineValue(insert.backup.text);
   if (insert.image) {
-    const url = safeUrl(insert.image);
-    return url ? `![Image](${url})` : "";
+    return deltaMediaMarkdown(insert.image, "image", options);
   }
   if (insert.video) {
-    const url = safeUrl(insert.video);
-    return url ? `[Video](${url})` : "";
+    return deltaMediaMarkdown(insert.video, "video", options);
   }
   if (insert.divider !== undefined) return "---";
   if (insert.vote) return renderVote(insert.vote);
@@ -809,7 +1069,8 @@ function renderDeltaEmbed(insert) {
   if (!key) return "";
   const url = isObject(value) ? safeUrl(value.url || value.src) : safeUrl(value);
   const label = humanizeKey(key);
-  return url ? `[${label}](${url})` : "";
+  conversionWarning(options, "UNSUPPORTED_DELTA_EMBED", options.sourcePath || key, "An unrecognized embedded block was retained where possible; presentation may be incomplete.");
+  return url ? markdownLink(label, url) : fallbackContent(insert, options);
 }
 
 function isInlineDeltaEmbed(insert) {
@@ -851,17 +1112,41 @@ function meaningfulDelta(ops) {
   });
 }
 
-export function quillDeltaToMarkdown(value) {
+export function quillDeltaToMarkdown(value, options = {}) {
   const ops = deltaOps(value);
   if (!meaningfulDelta(ops)) return "";
 
   const lines = [];
   let segments = [];
+  let plainSegments = [];
+  let codeLines = [];
+  let codeLanguage = "";
   let listKind = "";
   let listIndex = 0;
   let pendingBlockAttributes = {};
 
+  const flushCode = () => {
+    if (!codeLines.length) return;
+    const text = codeLines.join("\n");
+    const length = Math.max(3, ...[...text.matchAll(/`+/g)].map((match) => match[0].length + 1));
+    const marker = "`".repeat(length);
+    if (lines.length && lines.at(-1) !== "") lines.push("");
+    lines.push(`${marker}${codeLanguage}`, ...codeLines, marker, "");
+    codeLines = [];
+    listKind = ""; listIndex = 0;
+  };
+
   const finishLine = (attributes = {}) => {
+    const code = attributes["code-block"] ?? attributes.codeBlock;
+    if (code) {
+      const language = typeof code === "string" && /^[a-z0-9_+-]{1,30}$/i.test(code) ? code : "";
+      if (codeLines.length && language !== codeLanguage) flushCode();
+      codeLanguage = language;
+      codeLines.push(plainSegments.join(""));
+      segments = []; plainSegments = [];
+      return;
+    }
+    flushCode();
     let text = segments.join("").trimEnd();
     const header = Number(attributes.header);
     if (Number.isInteger(header) && header >= 1 && header <= 6 && text) {
@@ -881,12 +1166,13 @@ export function quillDeltaToMarkdown(value) {
     }
 
     lines.push(text);
-    segments = [];
+    segments = []; plainSegments = [];
   };
 
   const addBlock = (block) => {
     if (!block) return;
     if (segments.length) finishLine(pendingBlockAttributes);
+    flushCode();
     pendingBlockAttributes = {};
     if (lines.length && lines.at(-1) !== "") lines.push("");
     lines.push(...String(block).split("\n"));
@@ -895,13 +1181,13 @@ export function quillDeltaToMarkdown(value) {
     listIndex = 0;
   };
 
-  for (const op of ops) {
+  for (const [opIndex, op] of ops.entries()) {
     const attributes = isObject(op.attributes) ? op.attributes : {};
     if (typeof op.insert === "string") {
       const parts = op.insert.split("\n");
-      const hasBlockAttributes = Object.hasOwn(attributes, "header") || Object.hasOwn(attributes, "list") || Object.hasOwn(attributes, "indent");
+      const hasBlockAttributes = ["header", "list", "indent", "code-block", "codeBlock"].some((key) => Object.hasOwn(attributes, key));
       parts.forEach((part, index) => {
-        if (part) segments.push(formatInlineDeltaText(part, attributes));
+        if (part) { segments.push(formatInlineDeltaText(part, attributes)); plainSegments.push(part); }
         if (index < parts.length - 1) {
           finishLine({ ...pendingBlockAttributes, ...attributes });
           pendingBlockAttributes = {};
@@ -911,14 +1197,15 @@ export function quillDeltaToMarkdown(value) {
       continue;
     }
     if (isInlineDeltaEmbed(op.insert)) {
-      const rendered = renderDeltaEmbed(op.insert);
-      if (rendered) segments.push(rendered);
+      const rendered = renderDeltaEmbed(op.insert, { ...options, deltaAttributes: attributes, sourcePath: `${options.sourcePath || "delta"}.ops[${opIndex}]` });
+      if (rendered) { segments.push(rendered); plainSegments.push(rendered); }
       continue;
     }
-    addBlock(renderDeltaEmbed(op.insert));
+    addBlock(renderDeltaEmbed(op.insert, { ...options, deltaAttributes: attributes, sourcePath: `${options.sourcePath || "delta"}.ops[${opIndex}]` }));
   }
 
   if (segments.length) finishLine(pendingBlockAttributes);
+  flushCode();
   return cleanMarkdown(lines.join("\n"));
 }
 
@@ -955,12 +1242,12 @@ export function detectKind(payload) {
 
 function isReadableArticleHtml(value) {
   if (typeof value !== "string" || !value.trim()) return false;
-  const text = value.replace(/<[^>]+>/g, " ").trim();
-  return Boolean(text) && !LOCALE_PLACEHOLDER.test(text);
+  // Only observed full locale codes are placeholders; short words and media-only HTML are real bodies.
+  return !LOCALE_PLACEHOLDERS.has(value.trim().toLowerCase());
 }
 
 function hasMarkdownTable(value) {
-  return /^\|[^\n]*\|\s*\n\|\s*:?-{3,}:?\s*(?:\|\s*:?-{3,}:?\s*)+\|/m.test(String(value ?? ""));
+  return /^\|[^\n]*\|\s*\n\|\s*:?-{3,}:?\s*(?:\|\s*:?-{3,}:?\s*)*\|/m.test(String(value ?? ""));
 }
 
 function markdownTextLength(value) {
@@ -994,7 +1281,7 @@ export function richTextToMarkdown({ content, desc, structuredContent, structure
 
   const structured = deltaOps(structuredContent);
   if (meaningfulDelta(structured)) {
-    const body = quillDeltaToMarkdown(structured);
+    const body = quillDeltaToMarkdown(structured, options);
     if (body) {
       if (shouldPreferArticleHtml(content, htmlContent, body)) return { body: htmlContent, source: "html" };
       return { body, source: "quill-delta" };
@@ -1003,7 +1290,7 @@ export function richTextToMarkdown({ content, desc, structuredContent, structure
 
   const contentDelta = deltaOps(content);
   if (meaningfulDelta(contentDelta)) {
-    const body = quillDeltaToMarkdown(contentDelta);
+    const body = quillDeltaToMarkdown(contentDelta, options);
     if (body) {
       if (shouldPreferArticleHtml(content, htmlContent, body)) return { body: htmlContent, source: "html" };
       return { body, source: "quill-delta-content" };
@@ -1014,7 +1301,7 @@ export function richTextToMarkdown({ content, desc, structuredContent, structure
 
   const rows = deltaOps(structuredRows);
   if (meaningfulDelta(rows)) {
-    const body = quillDeltaToMarkdown(rows);
+    const body = quillDeltaToMarkdown(rows, options);
     if (body) return { body, source: "quill-delta-rows" };
   }
 
@@ -1068,7 +1355,7 @@ function hierarchyItems(component, context) {
   }
   if (!isObject(current)) {
     if (typeof current === "string") {
-      return [...htmlToMarkdown(current, context).matchAll(/^#{1,6}\s+(.+)$/gm)].map((match) => match[1].trim());
+      return markdownHeadings(htmlToMarkdown(current, context));
     }
     return [];
   }
@@ -1079,7 +1366,7 @@ function hierarchyItems(component, context) {
     return Object.entries(current.artifact_list).map(([key, item], index) => hierarchyItemLabel({ ...item, position: item?.position || humanizeKey(key) }, index + 1, context));
   }
   if (typeof current.data === "string" && current.data.trim()) {
-    return [...htmlToMarkdown(current.data, context).matchAll(/^#{1,6}\s+(.+)$/gm)].map((match) => match[1].trim());
+    return markdownHeadings(htmlToMarkdown(current.data, context));
   }
   return [];
 }
@@ -1134,7 +1421,9 @@ export function wikiHierarchy(payload, options = {}) {
     wiki_app: wikiApp,
     entry_page_id: entryId,
     title: cleanTitle(page?.name),
-    language: page?.lang || options.language,
+    language: page?.lang,
+    requested_language: options.language,
+    actual_language: page?.lang,
     source_url: wikiSourceUrl(wikiApp, entryId, options.sourceUrl),
     modules
   };
@@ -1146,7 +1435,7 @@ function selectorValue(selector, label) {
   return value;
 }
 
-function resolveWikiModule(page, selector) {
+export function resolveWikiModule(page, selector) {
   // Accept numeric, path-based, and name-based selectors so callers can use hierarchy output or human labels.
   const value = selectorValue(selector, "module");
   const modules = page?.modules || [];
@@ -1162,7 +1451,7 @@ function resolveWikiModule(page, selector) {
   throw new Error(`Unknown module selector '${value}'. Available modules: ${available || "none"}`);
 }
 
-function resolveWikiComponent(module, selector, expectedModuleIndex) {
+export function resolveWikiComponent(module, selector, expectedModuleIndex) {
   const value = selectorValue(selector, "component");
   const components = module?.components || [];
   const pathSelector = value.match(/^module\[(\d+)\]\.component\[(\d+)\]$/i);
@@ -1196,12 +1485,69 @@ function wikiMetadata(page, wikiApp, entryId, options = {}) {
     menu: page?.menu_name,
     status: page?.status,
     version: page?.version,
-    language: page?.lang || options.language,
+    language: page?.lang,
+    requested_language: options.language,
+    actual_language: page?.lang,
     icon_url: safeUrl(page?.icon_url),
     header_img_url: safeUrl(page?.header_img_url),
     source_url: wikiSourceUrl(wikiApp, entryId, options.sourceUrl),
     body_format: "structured-markdown"
   };
+}
+
+// These adapters preserve the existing rich-text renderers while exposing a shared document input.
+// Each section carries its upstream location; the document layer assigns bounded, revision-scoped blocks.
+export function articleDocumentParts(payload, options = {}) {
+  const data = unwrapApiData(payload);
+  const bundle = isObject(data?.post?.post) ? data.post : data;
+  const post = bundle?.post ?? {};
+  const warnings = [];
+  const body = articleBody(post, { ...options, warnings, sourcePath: "post.body" });
+  if (body.source.endsWith("desc")) warnings.push({ code: "DESCRIPTION_FALLBACK", path: "post.desc", message: "Only the description fallback was readable; a complete article body could not be confirmed." });
+  const title = cleanTitle(post.subject || post.title);
+  return {
+    metadata: compactMetadata({
+      schema: "hoyolab.article.v3", source: "HoYoLAB", kind: "article", post_id: String(post.post_id), title,
+      game_id: post.game_id, game: bundle?.game?.game_name, author: bundle?.user?.nickname,
+      created_at: epochToIso(post.created_at), updated_at: epochToIso(post.last_modify_time),
+      language: post.lang, api_origin_lang: post.origin_lang, is_multilingual: post.is_multi_language,
+      available_languages: post.multi_language_info?.langs, source_url: articleSourceUrl(post.post_id),
+      body_source: body.source, body_format: "markdown"
+    }),
+    sections: [{ level: 1, title: `Article: ${title}`, location: "post" },
+      { level: 2, title: "Article body", location: "post.body", markdown: nestArticleBody(body.body) }],
+    warnings, hasBody: Boolean(body.body), bodySource: body.source
+  };
+}
+
+export function wikiDocumentParts(payload, options = {}) {
+  const { page, wikiApp, entryId, context } = wikiPageInfo(payload, options);
+  const warnings = [];
+  const intro = [];
+  const header = safeUrl(page.header_img_url);
+  if (header) intro.push(markdownLink("Header", header, { image: true }));
+  if (page.desc) intro.push(nestWikiBody(htmlToMarkdown(page.desc, options), 1));
+  const sections = [{ level: 1, title: cleanTitle(page.name), location: "page", markdown: intro.filter(Boolean).join("\n\n") }];
+  for (const [moduleIndex, module] of page.modules.entries()) {
+    const moduleNumber = moduleIndex + 1;
+    const moduleTitle = wikiModuleTitle(module, moduleNumber);
+    sections.push({ level: 2, title: `${moduleNumber}. ${moduleTitle}`, location: `module[${moduleNumber}]` });
+    for (const [componentIndex, component] of (module.components || []).entries()) {
+      const componentNumber = componentIndex + 1;
+      const componentTitle = wikiComponentTitle(component);
+      const location = `module[${moduleNumber}].component[${componentNumber}]`;
+      const markdown = renderStructured(collapseComponentData(component.data), {
+        ...context, warnings, sourcePath: `${location}.data`, moduleIndex: moduleNumber, componentIndex: componentNumber,
+        componentId: component.component_id, ownerPath: `${moduleTitle} > ${componentTitle}`
+      });
+      sections.push({ level: 3, title: `${moduleNumber}.${componentNumber}. ${componentTitle}`, location,
+        component_id: component.component_id, markdown: nestWikiBody(markdown, 3) });
+    }
+  }
+  const { status: upstreamStatus, ...metadata } = wikiMetadata(page, wikiApp, entryId, options);
+  return { metadata: compactMetadata({ ...metadata, upstream_status: upstreamStatus, schema: "hoyolab.wiki.v3", language: page.lang,
+    available_languages: page.langs, source_url: wikiSourceUrl(wikiApp, entryId), updated_at: epochToIso(page.last_modify_time ?? page.updated_at) }),
+    sections, warnings, hasBody: sections.some((section) => Boolean(section.markdown)), bodySource: "wiki-structured" };
 }
 
 export function wikiLocationToMdx(payload, options = {}, selectors = {}) {
@@ -1224,7 +1570,7 @@ export function wikiLocationToMdx(payload, options = {}, selectors = {}) {
       ownerPath: `${moduleTitle} > ${componentTitle}`
     };
     const rendered = renderStructured(collapseComponentData(component.data), componentContext);
-    return `### ${moduleNumber}.${componentNumber}. ${componentTitle}\n\n${rendered || "> No readable structured content was returned."}`;
+    return `### ${moduleNumber}.${componentNumber}. ${componentTitle}\n\n${nestWikiBody(rendered, 3) || "> No readable structured content was returned."}`;
   });
   const sections = [
     frontmatter(wikiMetadata(page, wikiApp, entryId, options)),
@@ -1255,7 +1601,9 @@ export function articleToMdx(payload, options = {}) {
     author: user.nickname,
     created_at: epochToIso(post.created_at),
     updated_at: epochToIso(post.last_modify_time),
-    language: post.lang || options.language,
+    language: post.lang,
+    requested_language: options.language,
+    actual_language: post.lang,
     api_origin_lang: post.origin_lang,
     is_multilingual: post.is_multi_language,
     available_languages: post.multi_language_info?.langs,
@@ -1276,7 +1624,7 @@ export function wikiToMdx(payload, options = {}) {
   const metadata = wikiMetadata(page, wikiApp, entryId, options);
   const headerImage = safeUrl(page?.header_img_url);
   const sections = [frontmatter(metadata), `# ${title}`];
-  if (headerImage) sections.push(`![Page header](${headerImage})`);
+  if (headerImage) sections.push(markdownLink("Page header", headerImage, { image: true }));
   if (description) sections.push(`> ${description.replace(/\n/g, "\n> ")}`);
 
   for (const [moduleIndex, module] of (page?.modules || []).entries()) {
@@ -1296,7 +1644,7 @@ export function wikiToMdx(payload, options = {}) {
       };
       const rendered = renderStructured(dataValue, componentContext);
       if (!rendered) continue;
-      componentBlocks.push(`### ${moduleNumber}.${componentNumber}. ${componentTitle}\n\n${rendered}`);
+      componentBlocks.push(`### ${moduleNumber}.${componentNumber}. ${componentTitle}\n\n${nestWikiBody(rendered, 3)}`);
     }
     if (!componentBlocks.length) continue;
     sections.push(`## ${moduleNumber}. ${moduleTitle}\n\n${componentBlocks.join("\n\n")}`);

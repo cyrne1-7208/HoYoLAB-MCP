@@ -132,6 +132,29 @@ async function checkGame(game) {
   const wiki = await findWikiEntry(entryResults, game);
   const wikiArguments = { wiki_app: wiki.wikiApp, entry_page_id: wiki.entryPageId, language: game.language };
 
+  // Exercise document selection over the same stdio protocol used by consumers, without LLM evaluation.
+  const articleOutline = await callTool("read_hoyolab_article", { post_id: article.postId, language: game.language, view: "outline" });
+  const articleData = articleOutline.structuredContent;
+  const articleBlock = articleData.outline.flatMap((section) => section.blocks)[0];
+  requireValue(articleBlock, `${game.name} article outline returned no readable blocks`);
+  const articlePartial = await callTool("read_hoyolab_article", { post_id: article.postId, language: game.language,
+    revision: articleData.revision, block_ids: [articleBlock.block_id] });
+  const articlePartialData = validateMdx(articlePartial, `read_hoyolab_article:partial:${game.name}`, "article").structured;
+  requireValue(articlePartialData.blocks.length === 1, `${game.name} block selection returned unexpected blocks`);
+  const articleSearch = await callTool("read_hoyolab_article", { post_id: article.postId, language: game.language,
+    revision: articleData.revision, view: "search", query: "Article", max_matches: 1 });
+  requireValue(articleSearch.structuredContent.match_count > 0, `${game.name} document search found no blocks under the article heading`);
+  const wikiOutline = await callTool("read_hoyowiki_entry", { ...wikiArguments, revision: wiki.hierarchyData.revision, view: "outline" });
+  const wikiTable = wikiOutline.structuredContent.outline.flatMap((section) => section.blocks).find((block) => block.type === "table" && block.rows > 0);
+  let tableRowsChecked = false;
+  if (wikiTable) {
+    const rowRead = await callTool("read_hoyowiki_entry", { ...wikiArguments, revision: wiki.hierarchyData.revision,
+      table_block: wikiTable.block_id, row_start: 1, row_end: 1, max_chars: 200000 });
+    const rowBlock = rowRead.structuredContent.blocks.find((block) => block.block_id === wikiTable.block_id);
+    requireValue(rowBlock?.selected_rows?.start === 1 && rowBlock?.selected_rows?.end === 1, `${game.name} table selection did not preserve the selected row range`);
+    tableRowsChecked = true;
+  }
+
   const hierarchyText = textResult(wiki.hierarchy);
   // The hierarchy response is the source of truth for selectors passed to the scoped read tools.
   requireText(hierarchyText, `## ${wiki.module.number}. `, `get_hoyowiki_hierarchy:${game.name}`);
@@ -140,6 +163,7 @@ async function checkGame(game) {
 
   const moduleResult = await callTool("read_hoyowiki_module", {
     ...wikiArguments,
+    revision: wiki.hierarchyData.revision,
     module: wiki.module.location
   }, `read_hoyowiki_module:${game.name}`);
   const moduleChecked = validateMdx(moduleResult, `read_hoyowiki_module:${game.name}`, "wiki");
@@ -147,6 +171,7 @@ async function checkGame(game) {
 
   const componentResult = await callTool("read_hoyowiki_component", {
     ...wikiArguments,
+    revision: wiki.hierarchyData.revision,
     module: wiki.module.location,
     component: wiki.component.location
   }, `read_hoyowiki_component:${game.name}`);
@@ -173,7 +198,9 @@ async function checkGame(game) {
     entry_page_id: wiki.entryPageId,
     module_location: wiki.module.location,
     component_location: wiki.component.location,
-    reply_count: replyData.total_count ?? replyData.replies.length,
+    reply_count: replyData.returned_count,
+    document_views_checked: ["full", "outline", "search", "block-selection"],
+    table_rows_checked: tableRowsChecked,
     tools: REQUIRED_TOOLS
   };
 }

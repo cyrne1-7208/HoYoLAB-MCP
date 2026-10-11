@@ -1,3 +1,6 @@
+import { performance } from "node:perf_hooks";
+import { abortableDelay, createRequestGate, readBoundedResponse } from "./request-control.mjs";
+
 const COMMUNITY_API_BASE = "https://bbs-api-os.hoyolab.com";
 const WIKI_API_BASE = "https://sg-act-public-api-static.hoyolab.com";
 
@@ -38,12 +41,15 @@ const SEARCH_AUTHOR_TYPE_VALUES = Object.freeze([0, 1, 2]);
 // HoYoLAB uses locale headers to select multilingual article, reply, and Wiki responses.
 
 export class HoYoLabApiError extends Error {
-  constructor(message, { status, url, retcode, cause } = {}) {
+  constructor(message, { status, url, retcode, cause, code = "API_ERROR", retryable = false, retryAfterMs } = {}) {
     super(message, { cause });
     this.name = "HoYoLabApiError";
     this.status = status;
     this.url = url;
     this.retcode = retcode;
+    this.code = code;
+    this.retryable = retryable;
+    this.retryAfterMs = retryAfterMs;
   }
 }
 
@@ -51,9 +57,21 @@ export function normalizeHoYoLabLanguage(language) {
   if (language === undefined || language === null || language === "") return "";
   const normalized = LANGUAGE_ALIASES[String(language).trim().toLowerCase()];
   if (!normalized) {
-    throw new HoYoLabApiError(`Unsupported language: ${language}. Supported codes: ${LANGUAGE_CODES.join(", ")}`);
+    throw new HoYoLabApiError(`Unsupported language: ${language}. Supported codes: ${LANGUAGE_CODES.join(", ")}`, { code: "INVALID_LANGUAGE" });
   }
   return normalized;
+}
+
+export function normalizeReplyCursor(value) {
+  const cursor = typeof value === "string" ? value.trim()
+    : Number.isSafeInteger(value) && value >= 0 ? String(value) : "";
+  return cursor && cursor.length <= 128 ? cursor : undefined;
+}
+
+export function normalizeHoYoLabId(value) {
+  const id = typeof value === "string" ? value.trim()
+    : Number.isSafeInteger(value) && value >= 0 ? String(value) : "";
+  return /^\d{1,32}$/.test(id) ? id : undefined;
 }
 
 function safeInteger(value, fallback, { min, max }) {
@@ -68,8 +86,8 @@ function safeEnumInteger(value, fallback, values) {
 }
 
 function stringId(value, name) {
-  const id = String(value ?? "").trim();
-  if (!/^\d+$/.test(id)) throw new HoYoLabApiError(`${name} must be a numeric ID`);
+  const id = normalizeHoYoLabId(value);
+  if (!id) throw new HoYoLabApiError(`${name} must be a numeric ID of at most 32 digits`, { code: "INVALID_SELECTION" });
   return id;
 }
 
@@ -88,8 +106,10 @@ function languageHeaders(language, extra = {}) {
 }
 
 // Normalize timeout failures to the same public error type as HTTP and API-level failures.
-function abortError(url, timeoutMs) {
-  return new HoYoLabApiError(`HoYoLAB request timed out after ${timeoutMs}ms`, { url });
+function abortError(url, timeoutMs, cancelled) {
+  return new HoYoLabApiError(cancelled ? "HoYoLAB request was cancelled" : `HoYoLAB request timed out after ${timeoutMs}ms`, {
+    url, code: cancelled ? "CANCELLED" : "TIMEOUT", retryable: !cancelled
+  });
 }
 
 function unwrapApiResponse(payload) {
@@ -104,55 +124,105 @@ export function createHoYoLabClient({
   timeoutMs = Number(process.env.HOYOLAB_API_TIMEOUT_MS || 20000),
   defaultLanguage = process.env.HOYOLAB_LANGUAGE || "",
   defaultGameId = Number(process.env.HOYOLAB_GAME_ID || 2),
-  endpoints = HOYOLAB_ENDPOINTS
+  endpoints = HOYOLAB_ENDPOINTS,
+  maxRetries = 1,
+  maxRetryDelayMs = 2000,
+  maxResponseBytes = 8 * 1024 * 1024,
+  concurrency = 4,
+  maxQueue = 24,
+  minRequestIntervalMs = 100
 } = {}) {
   if (typeof fetchImpl !== "function") throw new Error("A fetch implementation is required");
   const requestTimeoutMs = Number.isFinite(timeoutMs) && timeoutMs > 0 ? timeoutMs : 20000;
+  const acquire = createRequestGate({ concurrency: safeInteger(concurrency, 4, { min: 1, max: 32 }), maxQueue: safeInteger(maxQueue, 24, { min: 0, max: 1000 }) });
+  const retryLimit = safeInteger(maxRetries, 1, { min: 0, max: 3 });
+  const responseLimit = safeInteger(maxResponseBytes, 8 * 1024 * 1024, { min: 1, max: 64 * 1024 * 1024 });
+  const interval = safeInteger(minRequestIntervalMs, 100, { min: 0, max: 10000 });
+  let nextRequestAt = 0;
+
+  async function pacedFetch(url, options) {
+    // Claim an interval only when fetch actually starts; cancelled waits must not accumulate future reservations.
+    while (nextRequestAt > performance.now()) await abortableDelay(nextRequestAt - performance.now(), options.signal);
+    options.signal?.throwIfAborted();
+    try {
+      return fetchImpl(url, options);
+    } finally {
+      // Monotonic timing and recording after synchronous dispatch keep clock changes or fetch setup from shortening the interval.
+      nextRequestAt = performance.now() + interval;
+    }
+  }
 
   async function get(url, { language = defaultLanguage, headers = {}, signal } = {}) {
     const normalizedLanguage = normalizeHoYoLabLanguage(language);
+    if (signal?.aborted) throw abortError(url, requestTimeoutMs, true);
     const controller = new AbortController();
     const timer = setTimeout(() => controller.abort(), requestTimeoutMs);
     const onAbort = () => controller.abort();
     signal?.addEventListener("abort", onAbort, { once: true });
+    let release;
     try {
-      const response = await fetchImpl(url, {
-        method: "GET",
-        headers: languageHeaders(normalizedLanguage, headers),
-        signal: controller.signal
-      });
-      // Parse the complete response before checking the API return code so callers receive useful error details.
-      const bodyText = await response.text();
-      let payload;
-      try {
-        payload = JSON.parse(bodyText);
-      } catch (error) {
-        throw new HoYoLabApiError("HoYoLAB returned a non-JSON response", {
-          status: response.status,
-          url,
-          cause: error
+      release = await acquire(controller.signal);
+      for (let attempt = 0; ; attempt += 1) {
+        const response = await pacedFetch(url, {
+          method: "GET",
+          headers: languageHeaders(normalizedLanguage, headers),
+          signal: controller.signal
         });
+        // Parse the complete response before checking the API return code so callers receive useful error details.
+        const bodyText = await readBoundedResponse(response, responseLimit, controller.signal);
+        let payload;
+        try {
+          payload = JSON.parse(bodyText);
+        } catch (error) {
+          if (response.ok) throw new HoYoLabApiError("HoYoLAB returned a non-JSON response", {
+            status: response.status,
+            url,
+            cause: error, code: "INVALID_RESPONSE"
+          });
+        }
+        if (!response.ok) {
+          const retryable = response.status === 429 || [500, 502, 503, 504].includes(response.status);
+          const retryHeader = response.headers?.get?.("retry-after");
+          const seconds = retryHeader == null ? NaN : Number(retryHeader);
+          const retryAfterMs = Number.isFinite(seconds) ? Math.max(0, seconds * 1000)
+            : retryHeader ? Math.max(0, Date.parse(retryHeader) - Date.now()) : undefined;
+          const backoff = Number.isFinite(retryAfterMs) ? retryAfterMs : 250 * 2 ** attempt;
+          if (retryable && attempt < retryLimit && backoff <= maxRetryDelayMs) {
+            await abortableDelay(backoff, controller.signal);
+            continue;
+          }
+          const code = response.status === 429 ? "RATE_LIMITED" : response.status === 404 ? "NOT_FOUND"
+            : [401, 403].includes(response.status) ? "ACCESS_DENIED" : "HTTP_ERROR";
+          throw new HoYoLabApiError(`HoYoLAB returned HTTP ${response.status}`, {
+            status: response.status,
+            url,
+            retcode: payload?.retcode, code, retryable,
+            retryAfterMs: Number.isFinite(retryAfterMs) ? retryAfterMs : undefined
+          });
+        }
+        if (payload && typeof payload.retcode === "number" && payload.retcode !== 0) {
+          throw new HoYoLabApiError(`HoYoLAB returned retcode ${payload.retcode}`, {
+            status: response.status,
+            url,
+            retcode: payload.retcode, code: "API_REJECTED"
+          });
+        }
+        if (payload && Object.hasOwn(payload, "retcode") && typeof payload.retcode !== "number") {
+          throw new HoYoLabApiError("HoYoLAB returned an invalid API return-code type", { url, code: "INVALID_RESPONSE" });
+        }
+        if (!payload || typeof payload !== "object" || Array.isArray(payload)) {
+          throw new HoYoLabApiError("HoYoLAB returned an invalid response object", { url, code: "INVALID_RESPONSE" });
+        }
+        return { payload, data: unwrapApiResponse(payload), url, status: response.status, language: normalizedLanguage || undefined, retrievedAt: new Date().toISOString() };
       }
-      if (!response.ok) {
-        throw new HoYoLabApiError(`HoYoLAB returned HTTP ${response.status}`, {
-          status: response.status,
-          url,
-          retcode: payload?.retcode
-        });
-      }
-      if (payload && typeof payload.retcode === "number" && payload.retcode !== 0) {
-        throw new HoYoLabApiError(payload.message || `HoYoLAB returned retcode ${payload.retcode}`, {
-          status: response.status,
-          url,
-          retcode: payload.retcode
-        });
-      }
-      return { payload, data: unwrapApiResponse(payload), url, status: response.status, language: normalizedLanguage || undefined };
     } catch (error) {
-      if (error?.name === "AbortError") throw abortError(url, requestTimeoutMs);
+      if (controller.signal.aborted) throw abortError(url, requestTimeoutMs, signal?.aborted);
       if (error instanceof HoYoLabApiError) throw error;
-      throw new HoYoLabApiError(`HoYoLAB request failed: ${error instanceof Error ? error.message : String(error)}`, { url, cause: error });
+      if (error?.message === "REQUEST_QUEUE_FULL") throw new HoYoLabApiError("Request queue is full; retry later", { url, code: "BUSY", retryable: true });
+      if (error?.message === "RESPONSE_TOO_LARGE") throw new HoYoLabApiError("HoYoLAB response exceeded the byte limit", { url, code: "RESPONSE_TOO_LARGE" });
+      throw new HoYoLabApiError("HoYoLAB network request failed", { url, cause: error, code: "NETWORK_ERROR", retryable: true });
     } finally {
+      release?.();
       clearTimeout(timer);
       signal?.removeEventListener("abort", onAbort);
     }
@@ -225,15 +295,20 @@ export function createHoYoLabClient({
     listType = 1,
     size = 15,
     page = 1,
+    lastId,
     language = defaultLanguage,
     signal
   } = {}) {
     const id = stringId(postId, "postId");
+    const cursor = lastId === undefined ? "0" : normalizeReplyCursor(lastId);
+    if (!cursor) throw new HoYoLabApiError("lastId must be a nonempty string cursor or a nonnegative safe integer, of at most 128 characters", { code: "INVALID_SELECTION" });
+    if (Number(page) > 1 && cursor === "0") throw new HoYoLabApiError("Reply pages after the first require last_id from the preceding response; page numbers alone do not advance the API", { code: "INVALID_SELECTION" });
     const url = new URL(endpoints.replies);
     setIfDefined(url, "list_type", safeInteger(listType, 1, { min: 0, max: 10 }));
     setIfDefined(url, "post_id", id);
     setIfDefined(url, "size", safeInteger(size, 15, { min: 1, max: 50 }));
-    setIfDefined(url, "page", safeInteger(page, 1, { min: 1, max: 10000 }));
+    // The endpoint advances with its returned cursor, not page/page_num or the last reply's ID.
+    setIfDefined(url, "last_id", cursor);
     return get(url.toString(), { language, signal });
   }
 
@@ -251,5 +326,5 @@ export function createHoYoLabClient({
     });
   }
 
-  return Object.freeze({ searchPosts, searchWiki, getArticle, getReplies, getWiki });
+  return Object.freeze({ searchPosts, searchWiki, getArticle, getReplies, getWiki, defaultLanguage: normalizeHoYoLabLanguage(defaultLanguage) });
 }

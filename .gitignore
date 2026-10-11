@@ -1,3 +1,42 @@
 node_modules/
 .env
+.env.*
+!.env.example
 coverage/
+
+# Environment-owned settings and local credentials are not project files.
+.codex/
+.agents/
+.aws/
+.gnupg/
+*.pem
+*.key
+
+# Browser/API investigation output. This can contain cookies, identifiers, or page data.
+artifacts/
+playwright-report/
+test-results/
+generated/
+*.log
+
+# Local tunnel profiles, PIDs, health URLs, and logs.
+runtime/
+
+# Local browser profile/state files.
+storage-state*.json
+*.har
+
+# Keep local investigation and connection helpers out of the MCP repository.
+/src/browser/
+/scripts/openai-tunnel.mjs
+/scripts/check-hoyolab-browser.mjs
+/scripts/capture-hoyolab.mjs
+/scripts/search-hoyolab.mjs
+/scripts/summarize-capture.mjs
+/scripts/convert-hoyolab.mjs
+/docs/api-research.md
+/docs/content-format-study.md
+
+# Local publishing folders.
+/commit/
+/github/

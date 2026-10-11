@@ -53,7 +53,7 @@ function validateMdxResult(kind, label) {
 function validateReplies(label) {
   return ({ text, structured }) => {
     requireText(text, "# Replies:", `${label} content`);
-    if (structured.total_count < 1 || !Array.isArray(structured.replies) || structured.replies.length < 1) {
+    if (structured.returned_count < 1 || !Array.isArray(structured.replies) || structured.replies.length < 1) {
       throw new Error(`${label} returned no structured replies`);
     }
     requireText(structured.markdown, "# Replies:", `${label} structuredContent`);

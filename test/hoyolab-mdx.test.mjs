@@ -365,3 +365,91 @@ test("infers headers only for simple Wiki HTML data tables", () => {
   assert.match(output, /\| Mora \| 100 \| 30 \|/);
   assert.doesNotMatch(output, /Column \d/);
 });
+
+test("short article bodies and HTML-only media are not locale placeholders", () => {
+  for (const content of ["Hi", "Yes", "OK", "en", "ja", "<p>en-us</p>"]) {
+    const result = richTextToMarkdown({ content });
+    assert.equal(result.source, "html");
+    assert.equal(result.body, content.replace(/<\/?p>/g, ""));
+  }
+  const media = richTextToMarkdown({ content: '<p><img src="https://example.com/image.png" alt="Only image"></p>' });
+  assert.equal(media.source, "html");
+  assert.match(media.body, /!\[Only image\]\(https:\/\/example\.com\/image\.png\)/);
+  assert.equal(richTextToMarkdown({ content: "en-us", structuredContent: JSON.stringify([{ insert: "Real Delta body\n" }]) }).source, "quill-delta");
+});
+
+test("JSON table cells, row conditions and header/table metadata survive with warnings", () => {
+  const warnings = [];
+  const result = richTextToMarkdown({ content: JSON.stringify({ table: {
+    caption: "Scaling caption", unit: "percent", notes: "Only while active",
+    columns: [{ key: "level", title: "Level", note: "Measured at full stacks" }, { key: "damage", title: "Damage" }],
+    rows: [{ level: "10", damage: { text: "42%", condition: "One target" }, note: "Row condition A" }]
+  } }) }, { warnings });
+  for (const text of ["Scaling caption", "percent", "Only while active", "Measured at full stacks", "42%", "One target", "Row condition A"]) {
+    assert.ok(result.body.includes(text), text);
+  }
+  assert.match(result.body, /\| Level \| Damage \|/);
+  assert.ok(warnings.some((warning) => warning.code === "UNSUPPORTED_TABLE_CELL"));
+  assert.ok(warnings.some((warning) => warning.code === "UNRECOGNIZED_TABLE_FIELD"));
+});
+
+test("HTML data and layout tables retain captions without forcing layout into a table", () => {
+  const data = richTextToMarkdown({ content: "<table><caption>Values in percent</caption><tr><th>Level</th><th>Damage</th></tr><tr><td>10</td><td>42</td></tr></table>" });
+  assert.match(data.body, /Values in percent/);
+  assert.match(data.body, /\| Level \| Damage \|/);
+  const layout = richTextToMarkdown({ content: "<table><caption>Owner note</caption><tr><td>Single decorative cell</td></tr></table>" });
+  assert.match(layout.body, /Owner note/);
+  assert.match(layout.body, /Single decorative cell/);
+  assert.doesNotMatch(layout.body, /^\|/m);
+});
+
+test("mixed Wiki lists and attribute/material extras preserve every item", () => {
+  const output = wikiToMdx({ retcode: 0, data: { page: { id: "9", name: "Mixed entry", modules: [{ name: "Details", components: [
+    { component_id: "customize", data: JSON.stringify({ list: [{ key: "HP", values: ["100", "200"], note: "At level 10" }, { title: "Ordinary skill", desc: "Required ordinary description" }] }) },
+    { component_id: "baseInfo", data: JSON.stringify({ list: [{ key: "Threshold", value: ["42%"], note: "Does not stack" }] }) },
+    { component_id: "talent", data: JSON.stringify({ list: [{ title: "Damage skill", desc: "Damage description", attributes: [{ key: "Scaling", value: ["55%"], note: "Single target" }], materials: ["20 plain material", "$[{\"ep_id\":8,\"name\":\"Linked material\",\"amount\":2}]$"] }] }) }
+  ] }] } } });
+  for (const text of ["100", "200", "At level 10", "Ordinary skill", "Required ordinary description", "42%", "Does not stack", "Scaling", "55%", "Single target", "20 plain material", "Linked material"]) {
+    assert.ok(output.includes(text), text);
+  }
+  assert.doesNotMatch(output, /^\| Field \|/m);
+});
+
+test("HTML and inline code literals remain intact while prose markup is converted", () => {
+  const result = richTextToMarkdown({ content: "<p>Prose <strong>value</strong>, <code>&lt;p&gt;literal&lt;/p&gt;</code>.</p><pre><code># code heading\n&lt;p&gt;example&lt;/p&gt;\n\n\nsecond line</code></pre>" });
+  assert.match(result.body, /Prose \*\*value\*\*/);
+  assert.match(result.body, /`<p>literal<\/p>`/);
+  assert.match(result.body, /# code heading\n<p>example<\/p>\n\n\nsecond line/);
+  const payload = { retcode: 0, data: { page: { id: "9", name: "Code entry", modules: [{ name: "Code", components: [{ component_id: "customize", data: JSON.stringify({ data: "<pre><code># comment\n&lt;p&gt;example&lt;/p&gt;</code></pre><h3>Actual heading</h3><p>Body</p>" }) }] }] } } };
+  const output = wikiToMdx(payload);
+  assert.match(output, /\n# comment\n<p>example<\/p>/);
+  assert.doesNotMatch(output, /\d+\.\d+\.\d+\. comment/);
+  const items = wikiHierarchy(payload).modules[0].components[0].items;
+  assert.equal(items.length, 1);
+  assert.ok(items[0].label.includes("Actual heading"));
+});
+
+test("Delta code blocks retain raw content, blank lines and an unambiguous fence", () => {
+  const output = quillDeltaToMarkdown([
+    { insert: "# literal heading\n\n<p>example</p>\n```", attributes: { "code-block": "html" } },
+    { insert: "\n", attributes: { "code-block": "html" } },
+    { insert: "Ordinary paragraph.\n" }
+  ]);
+  assert.match(output, /^````html\n# literal heading\n\n<p>example<\/p>\n```\n````\n/);
+  assert.match(output, /Ordinary paragraph\.$/);
+});
+
+test("unsafe HTML image URLs are removed and valid image labels stay readable", () => {
+  const result = richTextToMarkdown({ content: '<img src="javascript:alert(1)" alt="Unsafe image"><img src="data:image/svg+xml,example" alt="Inline image"><img src="https://example.com/image.png" alt="Safe [image]">' });
+  assert.doesNotMatch(result.body, /javascript:|data:/);
+  assert.match(result.body, /Unsafe image/);
+  assert.match(result.body, /Inline image/);
+  assert.match(result.body, /https:\/\/example\.com\/image\.png/);
+});
+
+test("overly deep or wide structured content fails with DOCUMENT_TOO_COMPLEX", () => {
+  let nested = { text: "Deep content" };
+  for (let depth = 0; depth < 2000; depth += 1) nested = { content: nested };
+  assert.throws(() => richTextToMarkdown({ content: JSON.stringify(nested) }), (error) => error.code === "DOCUMENT_TOO_COMPLEX");
+  assert.throws(() => richTextToMarkdown({ content: JSON.stringify({ blocks: Array.from({ length: 26000 }, () => ({ text: "Wide" })) }) }), (error) => error.code === "DOCUMENT_TOO_COMPLEX");
+});
