@@ -1348,8 +1348,7 @@ function hierarchyItemLabel(item, index, context) {
   return inlineValue(item, context) || `Item ${index}`;
 }
 
-function hierarchyItems(component, context) {
-  const current = collapseComponentData(component?.data);
+function hierarchyItems(current, context) {
   if (Array.isArray(current)) {
     return current.map((item, index) => hierarchyItemLabel(item, index + 1, context));
   }
@@ -1371,7 +1370,7 @@ function hierarchyItems(component, context) {
   return [];
 }
 
-export function wikiHierarchy(payload, options = {}) {
+function buildWikiHierarchy(payload, options, preparedComponents) {
   // Structured hierarchy fields retain API locations while labels stay compact for model-facing output.
   const { page, wikiApp, entryId, context } = wikiPageInfo(payload, options);
   const modules = (page?.modules || []).map((module, moduleIndex) => {
@@ -1387,7 +1386,9 @@ export function wikiHierarchy(payload, options = {}) {
         componentId: component.component_id,
         ownerPath: `${moduleTitle} > ${componentTitle}`
       };
-      const items = hierarchyItems(component, componentContext);
+      const prepared = preparedComponents?.get(`module[${moduleNumber}].component[${componentNumber}]`);
+      const current = prepared ? prepared.data : collapseComponentData(component.data);
+      const items = hierarchyItems(current, componentContext);
       return {
         component_index: componentNumber,
         number: `${moduleNumber}.${componentNumber}`,
@@ -1402,7 +1403,7 @@ export function wikiHierarchy(payload, options = {}) {
           title,
           location: `module[${moduleNumber}].component[${componentNumber}].item[${itemIndex + 1}]`
         })),
-        has_content: Boolean(renderStructured(collapseComponentData(component.data), componentContext))
+        has_content: Boolean(prepared ? prepared.markdown : renderStructured(current, componentContext))
       };
     });
     return {
@@ -1427,6 +1428,10 @@ export function wikiHierarchy(payload, options = {}) {
     source_url: wikiSourceUrl(wikiApp, entryId, options.sourceUrl),
     modules
   };
+}
+
+export function wikiHierarchy(payload, options = {}) {
+  return buildWikiHierarchy(payload, options);
 }
 
 function selectorValue(selector, label) {
@@ -1520,7 +1525,7 @@ export function articleDocumentParts(payload, options = {}) {
   };
 }
 
-export function wikiDocumentParts(payload, options = {}) {
+function buildWikiDocumentParts(payload, options, preparedComponents) {
   const { page, wikiApp, entryId, context } = wikiPageInfo(payload, options);
   const warnings = [];
   const intro = [];
@@ -1536,10 +1541,12 @@ export function wikiDocumentParts(payload, options = {}) {
       const componentNumber = componentIndex + 1;
       const componentTitle = wikiComponentTitle(component);
       const location = `module[${moduleNumber}].component[${componentNumber}]`;
-      const markdown = renderStructured(collapseComponentData(component.data), {
+      const data = collapseComponentData(component.data);
+      const markdown = renderStructured(data, {
         ...context, warnings, sourcePath: `${location}.data`, moduleIndex: moduleNumber, componentIndex: componentNumber,
         componentId: component.component_id, ownerPath: `${moduleTitle} > ${componentTitle}`
       });
+      preparedComponents?.set(location, { data, markdown });
       sections.push({ level: 3, title: `${moduleNumber}.${componentNumber}. ${componentTitle}`, location,
         component_id: component.component_id, markdown: nestWikiBody(markdown, 3) });
     }
@@ -1548,6 +1555,17 @@ export function wikiDocumentParts(payload, options = {}) {
   return { metadata: compactMetadata({ ...metadata, upstream_status: upstreamStatus, schema: "hoyolab.wiki.v3", language: page.lang,
     available_languages: page.langs, source_url: wikiSourceUrl(wikiApp, entryId), updated_at: epochToIso(page.last_modify_time ?? page.updated_at) }),
     sections, warnings, hasBody: sections.some((section) => Boolean(section.markdown)), bodySource: "wiki-structured" };
+}
+
+export function wikiDocumentParts(payload, options = {}) {
+  return buildWikiDocumentParts(payload, options);
+}
+
+export function wikiDocumentPartsWithHierarchy(payload, options = {}) {
+  // Reuse work only within this conversion; locations keep repeated component objects correctly numbered without retaining raw payloads in the document cache.
+  const preparedComponents = new Map();
+  const parts = buildWikiDocumentParts(payload, options, preparedComponents);
+  return { parts, hierarchy: buildWikiHierarchy(payload, options, preparedComponents) };
 }
 
 export function wikiLocationToMdx(payload, options = {}, selectors = {}) {

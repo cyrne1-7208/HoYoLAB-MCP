@@ -6,6 +6,8 @@ const transport = new StdioClientTransport({
   command: process.execPath,
   args: ["scripts/mcp-server.mjs"],
   cwd: process.cwd(),
+  // SDK defaults inherit only a small environment subset; keep network and configuration settings for this local child.
+  env: { ...process.env },
   stderr: "pipe"
 });
 

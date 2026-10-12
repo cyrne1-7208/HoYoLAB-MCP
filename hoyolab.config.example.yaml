@@ -1,0 +1,18 @@
+# Empty language leaves language selection to tool arguments or the API default.
+language: ""
+
+# 2 = Genshin Impact, 6 = Honkai: Star Rail, 8 = Zenless Zone Zero.
+gameId: 2
+
+api:
+  # Includes queue and pacing waits. Increase this when requests wait for longer intervals.
+  timeoutMs: 20000
+
+  # 0..10000 milliseconds. 1000 allows at most about one API start per second; 0 disables pacing.
+  minRequestIntervalMs: 100
+
+  # 1..32 active requests, including those waiting for their pacing interval.
+  concurrency: 4
+
+  # 0..1000 additional waiting requests. Queue overflow returns BUSY.
+  maxQueue: 24
