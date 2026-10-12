@@ -128,9 +128,9 @@ export function createHoYoLabClient({
   maxRetries = 1,
   maxRetryDelayMs = 2000,
   maxResponseBytes = 8 * 1024 * 1024,
-  concurrency = 4,
-  maxQueue = 24,
-  minRequestIntervalMs = 100
+  concurrency = Number(process.env.HOYOLAB_API_CONCURRENCY || 4),
+  maxQueue = Number(process.env.HOYOLAB_API_MAX_QUEUE || 24),
+  minRequestIntervalMs = Number(process.env.HOYOLAB_API_MIN_REQUEST_INTERVAL_MS || 100)
 } = {}) {
   if (typeof fetchImpl !== "function") throw new Error("A fetch implementation is required");
   const requestTimeoutMs = Number.isFinite(timeoutMs) && timeoutMs > 0 ? timeoutMs : 20000;

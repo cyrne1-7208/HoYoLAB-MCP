@@ -10,7 +10,8 @@ const GAMES = [
   { app: "zzz", gameId: 8, keyword: "Anby", entryId: "2", officialPost: "46622788", userPost: "45888979" }
 ];
 const client = new Client({ name: "hoyolab-regression-check", version: "0.1.0" });
-const transport = new StdioClientTransport({ command: process.execPath, args: ["scripts/mcp-server.mjs"], cwd: process.cwd(), stderr: "pipe" });
+// SDK defaults inherit only a small environment subset; keep network and configuration settings for this local child.
+const transport = new StdioClientTransport({ command: process.execPath, args: ["scripts/mcp-server.mjs"], cwd: process.cwd(), env: { ...process.env }, stderr: "pipe" });
 transport.stderr.on("data", (chunk) => process.stderr.write(chunk));
 let calls = 0;
 

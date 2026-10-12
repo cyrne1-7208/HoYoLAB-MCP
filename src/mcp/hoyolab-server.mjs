@@ -9,6 +9,7 @@ import { createRequestGate } from "../hoyolab/request-control.mjs";
 import { createDocumentStore } from "../document/document-store.mjs";
 import { readDocument, resolveWikiScope, validateDocumentSelection } from "../document/hoyolab-document.mjs";
 import { escapeMarkdownText, markdownLink } from "../transform/markdown-syntax.mjs";
+import { createTextPrefixes } from "../transform/text-prefix.mjs";
 import {
   cleanTitle,
   richTextToMarkdown,
@@ -428,6 +429,16 @@ function replyCoverage(records, field) {
   return records.some((record) => record[field] === "partial") ? "partial" : records.some((record) => record[field] === "unknown") ? "unknown" : "complete";
 }
 
+function selectedReplyCoverage(records, childCounts) {
+  let coverage = "complete";
+  for (const record of records) {
+    const value = replyChildCoverage(record, record.reply_id ? childCounts.get(record.reply_id) || 0 : 0);
+    if (value === "partial") return "partial";
+    if (value === "unknown") coverage = "unknown";
+  }
+  return coverage;
+}
+
 function formatReplyRecord(lines, record) {
   const headingLevel = "#".repeat(Math.min(6, 2 + Number(record.depth || 0)));
   const title = [record.reply_id ? `Reply ${record.reply_id}` : "Reply", record.author].filter(Boolean).join(" — ");
@@ -487,27 +498,38 @@ function formatReplies(payload, postId, language, options = {}, retrievedAt) {
     if (bodySize + chunk.length > maxChars) break;
     chunks.push(chunk); bodySize += chunk.length;
   }
+  const prefix = createTextPrefixes(chunks);
+  const receivedChildren = replyCoverage(records, "received_child_coverage");
+  const returnedChildCounts = new Map();
+  for (let index = offset; index < offset + chunks.length; index += 1) {
+    const record = records[index];
+    if (record.parent_reply_id) returnedChildCounts.set(record.parent_reply_id, (returnedChildCounts.get(record.parent_reply_id) || 0) + 1);
+  }
   // Budget the serialized envelope too; a fixed reservation can reject otherwise readable replies.
+  // Update the shrinking prefix's child counts instead of rebuilding them, while retaining exact sequential envelope checks.
   for (let count = chunks.length; count >= (records.length ? 1 : 0); count -= 1) {
+    if (count < chunks.length) {
+      const removed = records[offset + count];
+      if (removed.parent_reply_id) returnedChildCounts.set(removed.parent_reply_id, returnedChildCounts.get(removed.parent_reply_id) - 1);
+    }
     const continuation = offset + count < records.length ? { ...options, post_id: postId, language,
       reply_offset: offset + count, revision, max_chars: maxChars } : undefined;
     const pageWarnings = [...warnings];
     if (continuation) pageWarnings.push({ code: "OUTPUT_LIMIT", path: "replies", message: "More replies from this API page are available using continuation; its revision detects page changes." });
     let selected = records.slice(offset, offset + count);
-    const returnedChildCounts = new Map();
-    for (const record of selected) if (record.parent_reply_id) returnedChildCounts.set(record.parent_reply_id, (returnedChildCounts.get(record.parent_reply_id) || 0) + 1);
-    selected = selected.map((record) => {
-      const childCount = record.reply_id ? returnedChildCounts.get(record.reply_id) || 0 : 0;
-      return { ...record, returned_child_count: childCount, child_coverage: replyChildCoverage(record, childCount) };
-    });
-    const coverage = { root_page_is_last: data?.is_last, children: replyCoverage(selected, "child_coverage"),
-      received_children: replyCoverage(records, "received_child_coverage"), upstream_completeness: "not-verifiable", media: "links-only-no-ocr",
+    const coverage = { root_page_is_last: data?.is_last, children: selectedReplyCoverage(selected, returnedChildCounts),
+      received_children: receivedChildren, upstream_completeness: "not-verifiable", media: "links-only-no-ocr",
       output_truncated: Boolean(continuation), received_records: records.length, reply_offset: offset };
-    const body = heading + (records.length ? chunks.slice(0, count).join("") : "> No replies were returned.\n");
+    const body = heading + (records.length ? prefix(count) : "> No replies were returned.\n");
     const text = "---\n" + YAML.stringify({ kind: "article-replies", post_id: postId, revision, requested_language: language, retrieved_at: retrievedAt,
       source_url: articleUrl(postId), content_trust: "external-untrusted", coverage, warning_codes: [...new Set(pageWarnings.map((warning) => warning.code))], continuation, next_page: nextPage }, { lineWidth: 0 }).trimEnd()
       + "\n---\n" + body.trimEnd() + "\n";
     if (text.length > maxChars) continue;
+    // Child coverage is needed for budgeting, but full structured records are materialized only for the accepted page.
+    selected = selected.map((record) => {
+      const childCount = record.reply_id ? returnedChildCounts.get(record.reply_id) || 0 : 0;
+      return { ...record, returned_child_count: childCount, child_coverage: replyChildCoverage(record, childCount) };
+    });
     return { text, structured: {
       kind: "article-replies",
       post_id: postId,

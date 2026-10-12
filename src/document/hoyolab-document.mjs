@@ -1,8 +1,9 @@
 import { createHash } from "node:crypto";
 import YAML from "yaml";
 import { HoYoLabApiError, normalizeHoYoLabLanguage, normalizeHoYoLabId } from "../hoyolab/api.mjs";
-import { articleDocumentParts, wikiDocumentParts, wikiHierarchy, unwrapApiData, resolveWikiModule, resolveWikiComponent } from "../transform/hoyolab-mdx.mjs";
+import { articleDocumentParts, wikiDocumentParts, wikiDocumentPartsWithHierarchy, unwrapApiData, resolveWikiModule, resolveWikiComponent } from "../transform/hoyolab-mdx.mjs";
 import { openingFence, isClosingFence } from "../transform/markdown-syntax.mjs";
+import { createTextPrefixes } from "../transform/text-prefix.mjs";
 
 function fail(code, message) {
   throw new HoYoLabApiError(message, { code });
@@ -69,7 +70,8 @@ export function createDocument(payload, options) {
     || (module.components != null && (!Array.isArray(module.components) || module.components.some((component) => !isRecord(component))))))) {
     fail("INVALID_DOCUMENT", "Upstream Wiki hierarchy is missing or malformed");
   }
-  const parts = options.kind === "article" ? articleDocumentParts(payload, options) : wikiDocumentParts(payload, options);
+  const wikiParts = options.kind === "wiki" ? wikiDocumentPartsWithHierarchy(payload, options) : undefined;
+  const parts = options.kind === "article" ? articleDocumentParts(payload, options) : wikiParts?.parts || wikiDocumentParts(payload, options);
   const rawLanguage = typeof parts.metadata.language === "string" ? parts.metadata.language.trim() : "";
   try { parts.metadata.language = normalizeHoYoLabLanguage(rawLanguage) || undefined; }
   catch { parts.metadata.language = rawLanguage || undefined; }
@@ -114,26 +116,37 @@ export function createDocument(payload, options) {
   document.revision = createHash("sha256").update(JSON.stringify({ revisionMetadata, sections: document.sections, blocks: document.blocks })).digest("hex");
   document.metadata.revision = document.revision;
   if (options.kind === "wiki") {
-    document.hierarchy = wikiHierarchy(payload, options);
+    document.hierarchy = wikiParts.hierarchy;
+    const locations = indexSections(document.sections).byLocation;
     for (const module of document.hierarchy.modules) {
-      module.section_id = document.sections.find((section) => section.location === module.location)?.id;
+      module.section_id = locations.get(module.location)?.id;
       for (const component of module.components) {
-        component.section_id = document.sections.find((section) => section.location === component.location)?.id;
-        for (const item of component.items) item.section_id = document.sections.find((section) => section.location === item.location)?.id;
+        component.section_id = locations.get(component.location)?.id;
+        for (const item of component.items) item.section_id = locations.get(item.location)?.id;
       }
     }
   }
   return document;
 }
 
-function ancestors(document, sectionId) {
-  const path = [];
-  let section = document.sections.find((item) => item.id === sectionId);
-  while (section) {
-    path.unshift(section);
-    section = document.sections.find((item) => item.id === section.parent_id);
+function indexSections(sections) {
+  const byId = new Map();
+  const byLocation = new Map();
+  const paths = new Map();
+  for (const section of sections) {
+    // The first section owns a location shared by nested headings, matching the previous first-match lookup.
+    if (!byId.has(section.id)) byId.set(section.id, section);
+    if (!byLocation.has(section.location)) byLocation.set(section.location, section);
   }
-  return path;
+  return { byLocation, ancestors(sectionId) {
+    if (!paths.has(sectionId)) {
+      const path = [];
+      let section = byId.get(sectionId);
+      while (section) { path.unshift(section); section = byId.get(section.parent_id); }
+      paths.set(sectionId, path);
+    }
+    return paths.get(sectionId);
+  } };
 }
 
 function descendantIds(document, rootId) {
@@ -142,14 +155,14 @@ function descendantIds(document, rootId) {
   return ids;
 }
 
-function resolveSection(document, selector) {
+function resolveSection(document, selector, locations) {
   const raw = String(selector).trim();
   const value = /^\d+(?:\.\d+)*\.$/.test(raw) ? raw.slice(0, -1) : raw;
-  const found = document.sections.filter((section) => section.id === value || section.location === value
-    || section.title.toLocaleLowerCase() === value.toLocaleLowerCase() || section.title.match(/^(\d+(?:\.\d+)*)\./)?.[1] === value);
-  // Multiple headings can share an upstream location; the first is the owner section.
-  const locationMatch = found.find((section) => section.location === value);
+  const locationMatch = locations.get(value);
   if (locationMatch) return locationMatch;
+  const normalized = value.toLocaleLowerCase();
+  const found = document.sections.filter((section) => section.id === value || section.location === value
+    || section.title.toLocaleLowerCase() === normalized || section.title.match(/^(\d+(?:\.\d+)*)\./)?.[1] === value);
   if (found.length === 1) return found[0];
   fail(found.length ? "AMBIGUOUS_SECTION" : "SECTION_NOT_FOUND", "Use an exact section_id or location from view=outline for this document revision");
 }
@@ -209,7 +222,9 @@ function continuationBlocks(blocks, compact) {
 export function readDocument(document, options = {}) {
   const view = validateDocumentSelection(options);
   const resumeBase = options.continuation_input || options;
-  const root = options.section ? resolveSection(document, options.section) : undefined;
+  // Indexes are local to a read, so no model fields, revision hashes or cache accounting change.
+  const sections = indexSections(document.sections);
+  const root = options.section ? resolveSection(document, options.section, sections.byLocation) : undefined;
   const allowed = root ? descendantIds(document, root.id) : new Set(document.sections.map((section) => section.id));
   let blocks = document.blocks.filter((block) => allowed.has(block.section_id));
   const sectionBlocks = blocks;
@@ -217,7 +232,8 @@ export function readDocument(document, options = {}) {
   blocks = blocks.filter((block) => block.index >= (options.start_block || 1) && block.index <= upper);
   if (options.block_ids) {
     const ids = new Set(options.block_ids);
-    if (!ids.size || [...ids].some((id) => !blocks.some((block) => block.id === id))) fail("BLOCK_NOT_FOUND", "Every block_id must exist inside the selected document scope and range");
+    const available = new Set(blocks.map((block) => block.id));
+    if (!ids.size || [...ids].some((id) => !available.has(id))) fail("BLOCK_NOT_FOUND", "Every block_id must exist inside the selected document scope and range");
     blocks = blocks.filter((block) => ids.has(block.id));
   }
   if (options.block_ranges) {
@@ -235,8 +251,15 @@ export function readDocument(document, options = {}) {
   let nextMatchOffset;
   if (view === "search") {
     const terms = options.query.normalize("NFKC").toLocaleLowerCase().split(/\s+/).filter(Boolean);
+    let currentSection;
+    let currentTitles;
     const hits = blocks.filter((block) => {
-      const text = `${ancestors(document, block.section_id).map((section) => section.title).join(" ")} ${block.markdown}`.normalize("NFKC").toLocaleLowerCase();
+      // Blocks retain document order; keep only the current title prefix to avoid copying a long ancestor title for every section.
+      if (currentSection !== block.section_id || currentTitles === undefined) {
+        currentSection = block.section_id;
+        currentTitles = sections.ancestors(block.section_id).map((section) => section.title).join(" ");
+      }
+      const text = `${currentTitles} ${block.markdown}`.normalize("NFKC").toLocaleLowerCase();
       return terms.every((term) => text.includes(term));
     });
     matchCount = hits.length;
@@ -272,11 +295,12 @@ export function readDocument(document, options = {}) {
   const maxChars = options.max_chars || (view === "full" ? 60000 : 12000);
   // Measure the complete output, including selectors and resumable arguments, before accepting a page.
   // Only whole blocks/references are removed when metadata makes the tentative page too large.
-  const pack = (body, returned, continuation, outline) => {
+  // Keep descending candidates: continuation and selector YAML can change size at boundaries, so total size is not assumed monotonic.
+  const pack = (body, returned, continuation, outline, returnedCount = returned.length) => {
     const warnings = [...document.warnings];
     if (continuation) warnings.push({ code: "OUTPUT_LIMIT", path: "selection", message: "More selected content is available using the returned continuation arguments." });
     const coverage = { conversion: document.metadata.conversion_status, scope: view === "outline" ? "outline" : root || options.start_block || options.end_block || options.table_block || options.block_ids || options.block_ranges || view === "search" ? "selection" : "document",
-      total_document_blocks: document.blocks.length, selected_blocks: blocks.length, returned_blocks: returned.length,
+      total_document_blocks: document.blocks.length, selected_blocks: blocks.length, returned_blocks: returnedCount,
       output_truncated: Boolean(continuation), all_selected_blocks_returned: view === "outline" ? undefined : !continuation,
       all_matching_blocks_returned: view === "search" ? !continuation && nextMatchOffset === undefined : undefined,
       media: document.metadata.media_reading, upstream_completeness: "not-verifiable" };
@@ -287,8 +311,13 @@ export function readDocument(document, options = {}) {
       next_match_offset: nextMatchOffset, blocks: returned, continuation, coverage };
   };
   if (view === "outline") {
+    const ownedBlocks = new Map();
+    for (const block of document.blocks) {
+      if (!ownedBlocks.has(block.section_id)) ownedBlocks.set(block.section_id, []);
+      ownedBlocks.get(block.section_id).push(block);
+    }
     const entries = document.sections.filter((section) => allowed.has(section.id)).map((section) => ({ section_id: section.id, title: section.title, level: section.level, location: section.location,
-      blocks: document.blocks.filter((block) => block.section_id === section.id).map((block) => ({ block_id: block.id, index: block.index, type: block.type, characters: block.markdown.length,
+      blocks: (ownedBlocks.get(section.id) || []).map((block) => ({ block_id: block.id, index: block.index, type: block.type, characters: block.markdown.length,
         rows: block.table?.rows.length })) }));
     const offset = (options.outline_start || 1) - 1;
     if (offset >= entries.length && offset !== 0) fail("INVALID_SELECTION", "outline_start is outside the selected section list");
@@ -311,23 +340,28 @@ export function readDocument(document, options = {}) {
       const result = pack("", [], undefined, []);
       if (result.mdx.length <= maxChars) return result;
     }
+    const prefix = createTextPrefixes(units.slice(0, count).map((unit) => unit.text));
     for (; count > 0; count -= 1) {
-      const selected = units.slice(0, count);
-      const outline = [];
-      for (const unit of selected) {
-        if (!unit.block) outline.push({ ...unit.entry, blocks: [], total_section_blocks: unit.entry.blocks.length, block_start: unit.blockStart });
-        else outline.at(-1).blocks.push(unit.block);
-      }
-      const last = outline.at(-1);
+      const last = units[count - 1];
       // A nonempty owner heading alone cannot advance its block cursor.
-      if (!last.blocks.length && last.block_start <= last.total_section_blocks) continue;
+      if (!last.block && last.blockStart <= last.entry.blocks.length) continue;
       const next = units[count];
-      const nextSection = next?.sectionIndex ?? selected.at(-1).sectionIndex + 1;
+      const nextSection = next?.sectionIndex ?? last.sectionIndex + 1;
       const continuation = nextSection < entries.length ? { ...resumeBase, view, outline_start: nextSection + 1,
         outline_block_start: next?.block ? next.blockIndex + 1 : next?.blockStart || 1,
         max_chars: maxChars, revision: document.revision, refresh: undefined } : undefined;
-      const result = pack(selected.map((unit) => unit.text).join(""), [], continuation, outline);
-      if (result.mdx.length <= maxChars) return result;
+      const result = pack(prefix(count), [], continuation);
+      if (result.mdx.length <= maxChars) {
+        // Build structured references only after the serialized page fits; failed candidates need just their text and cursor.
+        const outline = [];
+        for (let index = 0; index < count; index += 1) {
+          const unit = units[index];
+          if (!unit.block) outline.push({ ...unit.entry, blocks: [], total_section_blocks: unit.entry.blocks.length, block_start: unit.blockStart });
+          else outline.at(-1).blocks.push(unit.block);
+        }
+        result.outline = outline;
+        return result;
+      }
     }
   } else {
     const emitted = new Set();
@@ -335,7 +369,7 @@ export function readDocument(document, options = {}) {
     const returned = [];
     let size = 0;
     for (const block of blocks) {
-      const chain = ancestors(document, block.section_id);
+      const chain = sections.ancestors(block.section_id);
       const headingChain = block.type === "heading" ? chain.slice(0, -1) : chain;
       const headings = headingChain.filter((section) => !emitted.has(section.id)).map((section) => `${"#".repeat(section.level)} ${section.title}`).join("\n\n");
       const chunk = `${headings ? headings + "\n\n" : ""}${block.markdown}\n\n`;
@@ -345,21 +379,26 @@ export function readDocument(document, options = {}) {
       returned.push({ block_id: block.id, index: block.index, type: block.type, section_id: block.section_id, location: block.source_location, source_position: block.source_position, selected_rows: block.selected_rows });
     }
     if (!blocks.length) {
-      const chain = root ? ancestors(document, root.id) : document.sections.slice(0, 2);
+      const chain = root ? sections.ancestors(root.id) : document.sections.slice(0, 2);
       let body = chain.map((section) => `${"#".repeat(section.level)} ${section.title}`).join("\n\n") + "\n\n";
       body += view === "search" ? "> No matching readable blocks were found.\n" : "> No readable body blocks were returned.\n";
       const result = pack(body, [], undefined);
       if (result.mdx.length <= maxChars) return result;
     }
+    const prefix = createTextPrefixes(chunks);
+    const tableIndex = options.table_block ? returned.findIndex((block) => block.block_id === options.table_block) : -1;
     for (let count = returned.length; count > 0; count -= 1) {
-      const tableAlreadyReturned = options.table_block && returned.slice(0, count).some((block) => block.block_id === options.table_block);
+      const tableAlreadyReturned = options.table_block && tableIndex >= 0 && tableIndex < count;
       const continuation = count === blocks.length ? undefined : view === "search" || options.block_ids || options.block_ranges || tableAlreadyReturned
         ? { ...resumeBase, view: "full", query: undefined, match_offset: undefined, max_matches: undefined, context_blocks: undefined,
           table_block: undefined, row_start: undefined, row_end: undefined,
           start_block: undefined, end_block: undefined, ...continuationBlocks(blocks.slice(count), Boolean(options.block_ranges || tableAlreadyReturned)), max_chars: maxChars, revision: document.revision, refresh: undefined }
         : { ...resumeBase, start_block: blocks[count].index, max_chars: maxChars, revision: document.revision, refresh: undefined };
-      const result = pack(chunks.slice(0, count).join(""), returned.slice(0, count), continuation);
-      if (result.mdx.length <= maxChars) return result;
+      const result = pack(prefix(count), returned, continuation, undefined, count);
+      if (result.mdx.length <= maxChars) {
+        result.blocks = returned.slice(0, count);
+        return result;
+      }
     }
   }
   fail("BUDGET_TOO_SMALL", "Increase max_chars to fit metadata and the next complete block/reference, or select a smaller table row range; content is never cut mid-block");

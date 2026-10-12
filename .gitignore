@@ -1,8 +1,12 @@
 node_modules/
 .env
 .env.*
-!.env.example
 coverage/
+
+# Machine-local settings; publish the generic example instead.
+/hoyolab.config.yaml
+/hoyolab.config.*.yaml
+!/hoyolab.config.example.yaml
 
 # Environment-owned settings and local credentials are not project files.
 .codex/
