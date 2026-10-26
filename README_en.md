@@ -7,6 +7,22 @@ An MCP server that searches HoYoLAB articles, replies, and HoYoWiki entries and 
 > [!CAUTION]
 > Before using this project, please read the [**Disclaimer**](#disclaimer) below.
 
+## Disclaimer
+
+> &emsp;&emsp;This is an **independent, unofficial open-source project** that is **not operated, provided, approved, or sponsored by** COGNOSPHERE PTE. LTD., miHoYo Co., Ltd., or any of their affiliates, has **no affiliation, agency, representation, partnership, or other relationship** with those companies, and **is not an official tool for any of their services or titles**.
+>
+> &emsp;&emsp;This project **does not use any API officially provided or approved for third parties** by HoYoLAB. Due to upstream specification changes, endpoint deprecation, rate limiting, access controls, or other factors, this project **may cease functioning in whole or in part at any time without notice**, and the developers and contributors **assume no obligation to maintain compatibility, fix defects, provide updates, or offer support**.
+>
+> &emsp;&emsp;Where copyrights, moral rights, or other rights subsist in content searched, retrieved, converted, displayed, or otherwise processed through this project—including articles, replies, HoYoWiki entries and data, images, videos, emojis, and metadata—such rights, together with all intellectual property rights concerning referenced company names, service names, game titles, character names, logos, trademarks, and other identifiers, **belong to their respective authors or rightful owners**. HoYoverse, HoYoLAB, HoYoWiki, Genshin Impact, Honkai: Star Rail, Zenless Zone Zero, and other names and logos are trademarks or registered trademarks of COGNOSPHERE PTE. LTD., miHoYo Co., Ltd., or their affiliates. References to such names or marks in this project are solely to indicate the target services, and this project **neither acquires nor claims any rights over them**. Furthermore, this repository's open-source license applies strictly to this project's own source code and documentation; it **transfers no rights in any third-party content or intellectual property, and this project has no authority to grant permission to reproduce, redistribute, republish, create derivative works from, build datasets from, train AI models on, commercially exploit, or otherwise use them**. Whether any such use is permissible must be determined by the user based on authorization from the respective rightsholders, applicable statutory limitations and exceptions, and the terms of the target services.
+>
+> &emsp;&emsp;You **use this project at your own risk and are solely responsible for reviewing and complying with all applicable terms of service, community guidelines, content policies, automated-access rules, other related policies, and laws and regulations** of each target service and jurisdiction. The publication and provision of this project **do not permit, encourage, or facilitate any violation of those terms**, circumvention of technical restrictions or access controls, unauthorized automated bulk collection, excessive request loads on target servers, infringement of third-party rights, or any other improper conduct.
+>
+> &emsp;&emsp;Search, MDX conversion, partial retrieval based on outlines, modules, table row ranges, or character limits, and other processing performed by this project **may omit, simplify, or alter portions of the original wording, structure, table data, media, context, or other elements**, and upstream API responses are not guaranteed to cover or reproduce all data shown on the official Web interface. Furthermore, because retrieved articles, replies, HoYoWiki entries, and other information are unverified third-party content that may contain inaccuracies, outdated information, malicious links, adversarial instructions targeting AI systems, or other risks, **verifying the authenticity and safety of retrieved information and implementing privilege controls and safeguards in connected MCP clients and AI agents are the user's sole responsibility**.
+>
+> &emsp;&emsp;This project and all retrieved or converted information are **provided "as is" and "as available" without warranty of any kind**, express or implied, including completeness, accuracy, reliability, usefulness, timeliness, merchantability, fitness for a particular purpose, non-infringement, security, or continuous and error-free availability. To the maximum extent permitted by applicable law, under no circumstances and under no legal theory—whether in contract, tort, negligence, strict liability, or otherwise—shall **the developers, copyright holders, or contributors of this project be liable for any direct, indirect, incidental, special, punitive, or consequential damages** arising out of or in connection with the use of or inability to use this project or the information obtained through it, including account or IP address suspensions or blocks, access or rate restrictions, data loss or corruption, system failures, AI misbehavior or inaccurate outputs, or disputes and claims involving third parties, even if advised of the possibility of such damages.
+>
+> &emsp;&emsp;All specific items, content types, rights, policies, processes, causes, risks, warranty items, and damages mentioned in this disclaimer are illustrative examples only, and **the scope of this disclaimer is not limited to the specified or enumerated contents**. If any part of this disclaimer is held invalid or unenforceable under applicable law, that part shall be enforced to the maximum extent permitted by law, and **the validity and enforceability of the remaining parts shall not be affected**.
+
 ## Overview
 
 HoYoLAB MCP lets MCP clients access information on HoYoLAB directly without a browser or account. Beyond full-page reads, clients can use outlines or in-document search to extract only the relevant sections or tables without exhausting context limits.
@@ -256,16 +272,6 @@ Nested HTML tables inside custom collapsible blocks remain outside this PR.
 ````
 
 </details>
-
-## Disclaimer
-
-This is an **unofficial project** and has **no affiliation, endorsement, or sponsorship** with COGNOSPHERE PTE. LTD., miHoYo Co., Ltd., or their affiliates. It **does not use an official third-party API** provided by HoYoLAB.
-
-All rights to content retrieved through this project (including articles, replies, and images) as well as referenced company names, service names, game titles, logos, and trademarks **belong to their respective authors and rightful owners**.
-
-Users **must comply with the terms of service and guidelines** of each target service. This project does not permit or encourage any violation of those terms.
-
-This project and the information retrieved through it are provided "as is" **without warranty of any kind**. The developers and contributors **assume no liability for any damages** arising from the use or inability to use this project, including access restrictions or data loss. **Use at your own risk**.
 
 ## License
 
